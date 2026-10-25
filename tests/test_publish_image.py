@@ -234,6 +234,14 @@ MISLEADING_ERRORS = [
     "ERROR: unexpected status from HEAD request: 429 Too Many Requests (request id 4F2A:403:9C1)",
     "ERROR: upstream returned 404 while the registry answered 503 Service Unavailable",
     "ERROR: 503 Service Unavailable: UNAUTHORIZED_TOKEN_SERVICE_RESTARTING",
+    # Throttling and server faults that arrive without a status number, with a
+    # "denied" or "not found" riding along.
+    "ERROR: denied: rate limit exceeded",
+    "ERROR: toomanyrequests: denied: too many requests",
+    "ERROR: Internal Server Error: manifest not found",
+    "ERROR: http2: server sent GOAWAY and closed the connection: denied",
+    "ERROR: context deadline exceeded: denied",
+    "ERROR: server error while reading the manifest: 404",
 ]
 # One transient signal per entry, each the ONLY such signal in its text, followed
 # by an absent-looking word. Deleting any one signal from the script's list must
@@ -252,7 +260,15 @@ TRANSIENT_SIGNALS = [
     "connection reset by peer",
     "connection refused",
     "dial tcp: lookup ghcr.io: no such host",
-    "lookup ghcr.io: Temporary failure in name resolution",
+    "lookup ghcr.io: failure in name resolution",
+    "please slow down: rate limit exceeded",
+    "toomanyrequests",
+    "too many requests",
+    "an internal server error",
+    "context deadline exceeded",
+    "stream closed after GOAWAY",
+    "a temporarily bad answer",
+    "something went wrong, try again later",
 ]
 TRANSIENT_WITH_ABSENT_WORD = [f"ERROR: {signal} (manifest not found, access denied)" for signal in TRANSIENT_SIGNALS]
 

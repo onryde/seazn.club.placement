@@ -54,7 +54,7 @@ digest_in() {
 # on the status codes so the digits of a commit sha in the image name cannot make
 # a 503 read as 404 (or the reverse).
 classify() {
-  local could_not_answer='(^|[^[:alnum:]])(429|5[0-9][0-9]|eof)([^[:alnum:]]|$)|timeout|timed out|unavailable|gateway|reset|refused|no such host|name resolution'
+  local could_not_answer='(^|[^[:alnum:]])(429|5[0-9][0-9]|eof)([^[:alnum:]]|$)|timeout|timed out|unavailable|gateway|reset|refused|no such host|name resolution|too many requests|toomanyrequests|rate limit|server error|deadline exceeded|goaway|temporar|try again'
   local says_absent='not found|manifest_unknown|name_unknown|denied|unauthorized|(^|[^[:alnum:]])(401|403|404)([^[:alnum:]]|$)'
   if grep -Eiq "$could_not_answer" <<<"$1"; then
     echo unknown
