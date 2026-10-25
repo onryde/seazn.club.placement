@@ -24,7 +24,7 @@ never passes on an entry it cannot read.
 Nothing here allocates or releases an address; the error message points at
 DEPLOY.md for that.
 
-Exit codes: 0 all private; 1 anything else, or flyctl failed; 2 usage.
+Exit codes: 0 all private; 1 anything else, or flyctl failed or could not be run; 2 usage.
 """
 
 import json
@@ -59,9 +59,14 @@ def main(argv):
         return 2
     app = argv[1]
 
-    result = subprocess.run(
-        ["flyctl", "ips", "list", "--app", app, "--json"], capture_output=True, text=True
-    )
+    try:
+        result = subprocess.run(
+            ["flyctl", "ips", "list", "--app", app, "--json"], capture_output=True, text=True
+        )
+    except OSError as error:
+        # flyctl missing from PATH (FileNotFoundError) or not runnable (PermissionError):
+        # an annotated failure, never a traceback, and never a pass.
+        return fail(f"could not run flyctl ({type(error).__name__}: {error}); the private-address check did not run")
     if result.returncode != 0:
         return fail(f"flyctl ips list --app {app} failed (exit {result.returncode}): {result.stderr.strip()}")
     try:

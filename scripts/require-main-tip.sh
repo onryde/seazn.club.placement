@@ -6,8 +6,14 @@
 # stg.yml runs when ci finishes for a push to main. Two pushes in a row can finish
 # out of order: the older commit's ci ends last and would deploy OVER the newer one,
 # leaving staging on old code until the next merge. Right before it deploys, the
-# job asks origin where main is now. If main has moved on, this commit is skipped,
-# and the newer commit's own ci run deploys that one.
+# job asks origin where main is now. If main has moved on, this commit is skipped.
+#
+# The newer commit's own stg run is what deploys it, and that run can be lost: the
+# concurrency group keeps one running run and ONE PENDING run, and a newer pending
+# run cancels the older one even with cancel-in-progress: false (which only protects
+# the running run). If the run for the tip was the one cancelled, staging stays on an
+# older commit until someone uses Actions to re-run the cancelled stg run, or the next
+# merge lands.
 #
 # Both answers exit 0 and are written as `current=true` or `current=false` to
 # $GITHUB_OUTPUT (when set); the workflow's later steps run only on `true`. Being
@@ -47,7 +53,7 @@ if [ "$tip" = "$sha" ]; then
   echo "$sha is the tip of main"
 else
   current=false
-  echo "::notice::$sha is no longer the tip of main ($tip is). Not deploying it: the newer commit's own ci run deploys that one."
+  echo "::notice::$sha is no longer the tip of main ($tip is). Not deploying it: the stg run for $tip deploys that one. If that run was cancelled while pending, re-run the cancelled stg run (nothing else will, until the next merge)."
 fi
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then

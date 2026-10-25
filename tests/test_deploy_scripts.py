@@ -37,6 +37,11 @@ PUBLIC_V4 = {"Address": "66.241.124.10", "Type": "v4", "Region": "global"}
 SHARED_V4 = {"Address": "137.66.1.2", "Type": "shared_v4", "Region": "global"}
 PUBLIC_V6 = {"Address": "2a09:8280:1::1:2345", "Type": "v6", "Region": "global"}
 EGRESS_V6 = {"Address": "2a09:8280:1::9", "Type": "egress_v6", "Region": "iad"}
+EGRESS_V4 = {"Address": "198.51.100.7", "Type": "egress_v4", "Region": "iad"}
+# Every value of flyctl's IPAddress "Type" (v0.4.115, read from its source on 2026-10-25).
+# The sweep below must cover each of them, so a type Fly adds to this list is a type
+# the table has to answer for.
+FLY_ADDRESS_TYPES = {"v4", "v6", "shared_v4", "private_v6", "egress_v4", "egress_v6"}
 
 FAKE_DOCKER = """#!/usr/bin/env bash
 echo "$*" >> "$FAKE_LOG"
@@ -155,9 +160,24 @@ def test_require_image_refuses_anything_but_the_sha_tag_before_asking_the_regist
     assert _calls(world) == [], f"{name}: the registry was asked about a malformed reference: {_calls(world)}"
 
 
-def test_require_image_bad_reference_table_is_not_vacuous():
-    # A refusal sweep over an empty or accidentally-valid table proves nothing.
-    assert len(BAD_IMAGES) >= 10
+# The rule a reference must satisfy is ghcr.io / onryde / seazn-placement : <40 lowercase
+# hex>, the whole string. Each clause below names the cases that break only it.
+REFERENCE_CLAUSES = {
+    "registry is ghcr.io": {"other-registry", "prefix"},
+    "owner is onryde": {"other-owner"},
+    "a tag is present": {"no-tag", "empty-tag", "digest-only"},
+    "the tag is a commit, not a name": {"latest", "main"},
+    "the commit is all 40 characters": {"short-sha", "long-sha"},
+    "the commit is lowercase": {"upper-case-sha"},
+    "nothing follows the commit": {"suffix", "newline"},
+}
+
+
+def test_require_image_bad_reference_table_covers_every_clause_of_the_rule():
+    # A refusal sweep over an empty or accidentally-valid table proves nothing, so the
+    # floor is the rule: every clause has a case, and every case belongs to a clause.
+    assert all(cases for cases in REFERENCE_CLAUSES.values())
+    assert set().union(*REFERENCE_CLAUSES.values()) == set(BAD_IMAGES)
     assert IMAGE not in BAD_IMAGES.values()
 
 
@@ -200,6 +220,7 @@ PUBLIC_CASES = {
     "shared-v4": [SHARED_V4],
     "public-v6": [PUBLIC_V6],
     "egress-v6": [EGRESS_V6],
+    "egress-v4": [EGRESS_V4],
     "private-then-v4": [PRIVATE, PUBLIC_V4],
     "v4-then-private": [PUBLIC_V4, PRIVATE],
     "private-then-shared-v4": [PRIVATE, SHARED_V4],
@@ -219,9 +240,13 @@ def test_private_ips_fail_on_any_address_that_is_not_a_private_v6(world, name):
     assert PRIVATE["Address"] not in result.stdout, "the private address is not an offender"
 
 
-def test_private_ips_public_case_table_is_not_vacuous():
-    assert len(PUBLIC_CASES) >= 8
+def test_private_ips_public_case_table_covers_every_address_type_fly_has():
+    # The floor is the type list, not a number: each type except the private v6 is
+    # refused on its own, and the private v6 appears in the mixed cases.
     assert all(any(a is not PRIVATE for a in case) for case in PUBLIC_CASES.values())
+    alone = {case[0]["Type"] for case in PUBLIC_CASES.values() if len(case) == 1}
+    assert alone == FLY_ADDRESS_TYPES - {PRIVATE["Type"]}, alone
+    assert {a["Type"] for case in PUBLIC_CASES.values() for a in case} == FLY_ADDRESS_TYPES
 
 
 def test_private_ips_fail_when_there_is_no_address_at_all(world):
@@ -263,6 +288,21 @@ def test_private_ips_fail_when_flyctl_fails(world):
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert "::error::" in result.stdout, result.stdout
     assert _calls(world) == ["ips list --app placement --json"], _calls(world)
+
+
+@pytest.mark.parametrize("how", ["missing", "not-executable"])
+def test_private_ips_fail_cleanly_when_flyctl_cannot_run_at_all(world, how):
+    # No traceback: a missing or unrunnable flyctl is an annotated failure like any other.
+    # (FileNotFoundError and PermissionError are two OSErrors; both must be caught.)
+    bin_dir = world["dir"] / "no-flyctl-here"
+    bin_dir.mkdir()
+    if how == "not-executable":
+        (bin_dir / "flyctl").write_text("#!/bin/sh\n")
+    result = _run([sys.executable, str(REQUIRE_PRIVATE_IPS), "placement"], world, PATH=str(bin_dir))
+    assert result.returncode == 1, (how, result.stdout, result.stderr)
+    assert "::error::" in result.stdout and "flyctl" in result.stdout, result.stdout
+    assert "Traceback" not in result.stderr, result.stderr
+    assert _calls(world) == [], "the fake flyctl was on PATH: the case did not remove it"
 
 
 def test_private_ips_ignore_noise_flyctl_writes_to_stderr(world):
@@ -347,6 +387,9 @@ def test_main_tip_is_superseded_after_main_moves_on(world, origin):
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert written == ["current=false"], written
     assert "::notice::" in result.stdout and second in result.stdout, result.stdout
+    # The newer commit's run can itself be cancelled while pending (concurrency keeps
+    # one pending run), so the notice says what to do then.
+    assert "re-run the cancelled stg run" in result.stdout, result.stdout
     # The same script, asked about the new tip, says current: the answer follows
     # the remote, not a constant.
     result, written = _tip(world, origin, second)
