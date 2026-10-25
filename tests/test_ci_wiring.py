@@ -42,7 +42,7 @@ ALLOWED_ACTIONS = {
     "docker/login-action",
 }
 USES_LINE = re.compile(r"^\s*(?:- )?uses:")
-USES_PINNED = re.compile(r"^\s*(?:- )?uses: ([\w.-]+/[\w.-]+)@([0-9a-f]{40}) # v\d+$")
+USES_PINNED = re.compile(r"^\s*(?:- )?uses: ([\w.-]+/[\w.-]+)@([0-9a-f]{40}) # v\d+(?:\.\d+){0,2}$")
 EXPECTED_TIMEOUTS = {"test": 30, "docker": 20, "buf-breaking": 10, "publish": 10}
 
 
@@ -149,10 +149,11 @@ def test_publish_runs_only_on_main_after_every_gate():
     publish = jobs["publish"]
     condition = re.search(r"^    if: (.+)$", publish, re.MULTILINE)
     assert condition, "publish has no job-level 'if:'"
-    condition = condition.group(1)
-    assert "github.event_name == 'push'" in condition, condition
-    assert "github.ref == 'refs/heads/main'" in condition, condition
-    assert "||" not in condition, f"an OR would let a pull request publish: {condition}"
+    # Exact, not "contains both": `always() && ...` and `!cancelled() && ...` keep
+    # both substrings yet run the job after a failed gate (or a cancelled run).
+    assert condition.group(1) == "github.event_name == 'push' && github.ref == 'refs/heads/main'", condition.group(1)
+    for status_function in ("always(", "cancelled(", "failure("):
+        assert status_function not in publish, f"{status_function} in publish lets it run past a failed gate"
     needs = re.search(r"^    needs: \[(.*)\]$", publish, re.MULTILINE)
     assert needs, "publish has no inline 'needs: [...]'"
     assert {"test", "docker", "buf-breaking"} <= {n.strip() for n in needs.group(1).split(",")}
@@ -215,6 +216,9 @@ def test_docker_exports_the_tested_image_and_publish_pushes_that_one():
     upload = _step_using(docker, "actions/upload-artifact")
     assert "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" in upload, upload
     assert f"          path: {TAR_PATH}\n" in upload and "if-no-files-found: error" in upload, upload
+    # The tar is the whole image: a day is enough for the publish job of this run
+    # and no longer than that is wanted (a copy of the image outlives the run).
+    assert "          retention-days: 1\n" in upload, upload
     artifact = re.search(r"^          name: (\S+)$", upload, re.MULTILINE).group(1)
 
     # publish takes that artifact; it builds nothing.
@@ -345,6 +349,57 @@ def test_docker_job_builds_the_root_dockerfile_without_pushing():
     assert "Container starts and the port accepts a TCP connection" in jobs["docker"]
 
 
+def _logical_lines(body):
+    """A run body's lines with backslash continuations joined."""
+    return re.sub(r"\\\n\s*", " ", body).splitlines()
+
+
+def test_nothing_builds_or_pushes_an_image_outside_the_publish_script():
+    # The docker job builds the one image (build-push-action, push: false) and the
+    # publish script pushes it. A `docker build` or `docker push` typed into any
+    # run block would be a second image, or a push that skips the sha-tag guard.
+    forbidden = re.compile(r"\bdocker\s+(?:buildx\s+build|build|(?:image\s+)?push)\b")
+    checked = 0
+    expected = 0
+    for name, text in _workflows().items():
+        code = _code(text)
+        expected += len(re.findall(r"^\s*(?:- )?run:", code, re.MULTILINE))
+        for job, block in _jobs(code).items():
+            for body in _run_bodies(block):
+                checked += 1
+                for line in _logical_lines(body):
+                    assert not forbidden.search(line), f"{name}:{job}: {line.strip()}"
+    assert checked == expected > 0, (checked, expected)
+    # Positive pair: the push the sweep above forbids elsewhere lives in the script.
+    script = (REPO_ROOT / "scripts" / "publish-image.sh").read_text()
+    assert re.search(r"^docker push ", script, re.MULTILINE)
+
+
+# `docker run` options that take a value, so that value is not read as the image.
+DOCKER_RUN_VALUE_FLAGS = {"-e", "--env", "-p", "--publish", "--name", "-v", "--volume", "--entrypoint", "-w", "--workdir", "--network", "-u", "--user"}
+
+
+def test_every_docker_run_runs_the_image_that_was_built_here():
+    _, jobs = _ci()
+    docker = jobs["docker"]
+    images = []
+    for body in _run_bodies(docker):
+        for line in _logical_lines(body):
+            for command in line.split("docker run")[1:]:
+                tokens = command.split()
+                index = 0
+                while index < len(tokens) and tokens[index].startswith("-"):
+                    index += 2 if tokens[index] in DOCKER_RUN_VALUE_FLAGS else 1
+                assert index < len(tokens), f"docker run names no image: {command.strip()}"
+                images.append(tokens[index])
+    # Derived: every `docker run` in the block was parsed, and there is at least one.
+    assert len(images) == docker.count("docker run") > 0, (len(images), docker.count("docker run"))
+    # The image argument itself, not any mention of the tag on the same line.
+    assert images == [TESTED_TAG] * len(images), images
+    # Nothing outside the docker job runs a container.
+    assert [job for job, block in jobs.items() if "docker run" in block] == ["docker"]
+
+
 # --- actions, triggers, limits and layout ------------------------------------------------
 
 
@@ -357,7 +412,7 @@ def test_every_action_is_sha_pinned_and_on_the_allowlist():
                 continue
             expected += 1
             match = USES_PINNED.match(line)
-            assert match, f"{name}:{number}: not '@<40-hex sha> # vN': {line.strip()}"
+            assert match, f"{name}:{number}: not '@<40-hex sha> # vN[.N.N]': {line.strip()}"
             found.append(match.group(1))
     assert len(found) == expected > 0, (len(found), expected)
     assert set(found) == ALLOWED_ACTIONS, (sorted(set(found) - ALLOWED_ACTIONS), sorted(ALLOWED_ACTIONS - set(found)))

@@ -76,7 +76,7 @@ jobs:
       # tests/test_buf_breaking.py drives the real buf and FAILS (never skips)
       # when it is missing: a skipped contract gate is a vacuous one.
       - name: Install buf
-        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
         with:
           setup_only: true
           version: ${{ env.BUF_VERSION }}
@@ -303,7 +303,7 @@ jobs:
           persist-credentials: false
 
       - name: Install buf
-        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
         with:
           setup_only: true
           version: ${{ env.BUF_VERSION }}

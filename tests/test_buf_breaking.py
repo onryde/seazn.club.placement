@@ -367,8 +367,8 @@ def test_fails_on_a_removed_field(tmp_path):
 
 
 def test_fails_on_a_renumbered_field(tmp_path):
-    # The proto3 hazard placement-stg.yml:24-27 (seazn.club) names: the same
-    # name on a new number reads as a different field to an old client.
+    # The proto3 hazard: the same name on a new number reads as a different
+    # field to an old client, which has not re-vendored the proto yet.
     result = _compare(
         tmp_path,
         _proto("string a = 1;"),
@@ -470,6 +470,17 @@ def test_a_base_without_buf_yaml_is_still_compared(tmp_path):
 
     _commit(repo, {"proto/scheduler.proto": _proto("string b = 2;")}, "head: removes a")
     _assert_buf_found_a_break(_run(repo, base), field="1")
+
+
+def test_the_temp_dir_is_named_under_tmpdir_explicitly():
+    # BSD/macOS `mktemp -d` ignores TMPDIR unless it is given a template, so
+    # without this text the "nothing is left in TMPDIR" checks below pass on a
+    # developer's Mac whether or not the trap runs (they watch an empty dir the
+    # script never used). GNU mktemp, on CI, would not give that away.
+    code = [line for line in SCRIPT.read_text().splitlines() if not line.lstrip().startswith("#")]
+    makers = [line for line in code if re.search(r"\bmktemp\b", line)]
+    assert len(makers) == 1, makers
+    assert 'mktemp -d "${TMPDIR:-/tmp}/buf-breaking.XXXXXX"' in makers[0], makers[0]
 
 
 def test_the_script_leaves_nothing_behind(tmp_path):
