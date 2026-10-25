@@ -1,5 +1,6 @@
 """Pins on ``.github/workflows/*.yml``: who may write packages, what publishes,
-which image tag exists, which actions run and what the buf gate is given.
+which image tag exists, which actions run and what the buf gate is given, plus
+the one Dockerfile line that links the image to this repository.
 
 These are pure text reads. There is no YAML library in this project's
 dependencies and none is wanted: the pins below are about literal lines
@@ -14,6 +15,7 @@ Floors are derived from the files, never typed in.
 """
 
 import re
+import shlex
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +24,8 @@ JOB_HEADER = re.compile(r"^  ([a-z0-9-]+):[ \t]*$", re.MULTILINE)
 
 IMAGE_REPO = "ghcr.io/onryde/seazn-placement"
 SOURCE_LABEL = "org.opencontainers.image.source=https://github.com/onryde/seazn.club.placement"
+LABEL_KEY, _, SOURCE_URL = SOURCE_LABEL.partition("=")
+DOCKERFILE = REPO_ROOT / "Dockerfile"
 TAR_PATH = "${{ runner.temp }}/placement-image.tar"
 TESTED_TAG = "placement-service:ci"
 # Assembled from pieces so tests/test_repo_layout.py's sweep does not match this file.
@@ -197,6 +201,73 @@ def test_image_links_to_this_repo():
     # publish job pushes that image, it does not build one.
     build = _step_using(jobs["docker"], "docker/build-push-action")
     assert re.search(rf"^          labels: {re.escape(SOURCE_LABEL)}$", build, re.MULTILINE), build
+
+
+# --- the Dockerfile says it too -----------------------------------------------
+#
+# ci.yml passes the label to the build, but the image is only as good as the
+# build that made it: a Dockerfile that carries the label itself keeps it
+# whoever builds the image, and scripts/publish-image.sh refuses an image without
+# it.
+
+
+def _final_stage_labels(dockerfile):
+    """Dockerfile text -> (instruction count, FROM count, {label key: [values...]})
+    for the LABEL instructions of the LAST stage, the one that becomes the image.
+
+    Comment lines are skipped and a trailing backslash joins the next line, as
+    docker reads them. ``LABEL k=v`` and ``LABEL k="v"`` are the same label."""
+    instructions, pending = [], ""
+    for raw in dockerfile.splitlines():
+        line = raw.strip()
+        if line.startswith("#") or (not line and not pending):
+            continue
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        keyword, _, rest = (pending + line).partition(" ")
+        instructions.append((keyword.upper(), rest.strip()))
+        pending = ""
+    froms = [i for i, (keyword, _) in enumerate(instructions) if keyword == "FROM"]
+    labels = {}
+    if froms:
+        for keyword, rest in instructions[froms[-1] + 1 :]:
+            if keyword != "LABEL":
+                continue
+            for token in shlex.split(rest):
+                key, equals, value = token.partition("=")
+                assert equals, f"LABEL token without '=': {token!r}"
+                labels.setdefault(key, []).append(value)
+    return len(instructions), len(froms), labels
+
+
+def test_the_dockerfile_labels_the_image_with_this_repo():
+    count, froms, labels = _final_stage_labels(DOCKERFILE.read_text())
+    # Anti-vacuity: it read a Dockerfile with a base image and instructions.
+    assert froms >= 1 and count > froms, (count, froms)
+    assert labels.get(LABEL_KEY) == [SOURCE_URL], labels
+
+
+def test_the_dockerfile_label_reader_sees_only_the_final_stage_and_real_instructions():
+    # The cases that make the test above mean something: each of these must NOT
+    # read as "the image carries the label", and the two spellings that do must.
+    url = SOURCE_URL
+    cases = {
+        "commented out": (f"FROM a\n# LABEL {LABEL_KEY}={url}\nRUN x\n", {}),
+        "before the final FROM": (f"FROM a\nLABEL {LABEL_KEY}={url}\nFROM b\nRUN x\n", {}),
+        "no label at all": ("FROM a\nRUN x\n", {}),
+        "no FROM at all": (f"LABEL {LABEL_KEY}={url}\n", {}),
+        "the wrong value": (f"FROM a\nLABEL {LABEL_KEY}={url}.git\n", {LABEL_KEY: [url + ".git"]}),
+        "quoted": (f'FROM a\nLABEL {LABEL_KEY}="{url}"\n', {LABEL_KEY: [url]}),
+        "unquoted": (f"FROM a\nLABEL {LABEL_KEY}={url}\n", {LABEL_KEY: [url]}),
+        "in the final stage of two": (f"FROM a\nFROM b\nLABEL {LABEL_KEY}={url}\n", {LABEL_KEY: [url]}),
+        "continued": (f"FROM a\nLABEL x=y \\\n  {LABEL_KEY}={url}\n", {"x": ["y"], LABEL_KEY: [url]}),
+        # docker drops a comment line whole: its trailing backslash continues nothing,
+        # so the LABEL on the next line is a real instruction, not part of the comment.
+        "comment ending in a backslash": (f"FROM a\n# note \\\nLABEL {LABEL_KEY}={url}\n", {LABEL_KEY: [url]}),
+    }
+    for name, (text, expected) in cases.items():
+        assert _final_stage_labels(text)[2] == expected, name
 
 
 def test_docker_exports_the_tested_image_and_publish_pushes_that_one():

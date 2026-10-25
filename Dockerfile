@@ -17,6 +17,14 @@
 # real; see the Task 08 report for what could and couldn't be proven locally.
 FROM python:3.14.6-slim-bookworm
 
+# Which repository this image belongs to. GHCR reads this label to link a new
+# package to its repository (GitHub recommends it). It grants nothing on a package
+# that already exists: that package's Actions access is set in its own settings
+# (DEPLOY.md, §4). ci.yml passes the same label at build time; it is stated here
+# too so a build that drops --label cannot lose it, and scripts/publish-image.sh
+# refuses to push an image that does not carry it.
+LABEL org.opencontainers.image.source="https://github.com/onryde/seazn.club.placement"
+
 WORKDIR /app
 
 # pyproject.toml copied ahead of src/ for readability (manifest before

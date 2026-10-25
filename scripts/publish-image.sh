@@ -10,6 +10,15 @@
 # The publish job never rebuilds: a rebuild would resolve floating inputs again
 # (dependency ranges, the base image tag) and could push bytes nobody tested.
 #
+# The loaded image must say which repository it belongs to. GHCR reads the image's
+# org.opencontainers.image.source label to link a new package to its repository
+# (GitHub recommends it). This is a precheck against a build that drops it: after
+# `docker load` the label is read off the tested image and must be exactly this
+# repository's URL; anything else stops the script before the tag and the push,
+# with the label it found. It does not make a push succeed and it does not explain
+# a denial: a package that already exists grants a repository access in its own
+# settings, whatever the image's labels say (DEPLOY.md, §4).
+#
 # A re-run of a push to main must not move a sha tag that already exists, so the
 # registry is asked first, and a failed question is classified, not shrugged off:
 #
@@ -26,9 +35,10 @@
 #                           that says both ("503 ..." with "not found" in its
 #                           body) is unknown too: the status wins.
 #
-# Exit codes: 0 pushed, or already published; 1 the registry could not be asked or
-# a digest could not be read; 2 usage; anything else is the failing docker
-# command's own code.
+# Exit codes: 0 pushed, or already published; 1 the registry could not be asked, the
+# loaded image's source label could not be read or is not this repository's, or a
+# digest could not be read; 2 usage; anything else is the failing docker command's
+# own code.
 set -euo pipefail
 
 if [ "$#" -ne 3 ]; then
@@ -38,6 +48,11 @@ fi
 tar_file="$1"
 tested="$2"
 image="$3"
+
+# The label GHCR reads to link a new package to a repository, and the one value
+# it may have here: this repository (the Dockerfile and ci.yml set the same).
+label_key="org.opencontainers.image.source"
+source_url="https://github.com/onryde/seazn.club.placement"
 
 # Reads `docker buildx imagetools inspect` output on stdin and prints its
 # `Digest:` value; fails when there is none.
@@ -102,6 +117,18 @@ if tag_exists; then
 fi
 
 docker load --input "$tar_file"
+
+# The tested image, as loaded, not the published name (it does not exist until
+# the tag below). An absent label prints as an empty string.
+if ! label="$(docker image inspect --format "{{ index .Config.Labels \"$label_key\" }}" "$tested")"; then
+  echo "::error::cannot read the $label_key label of $tested after loading $tar_file"
+  exit 1
+fi
+if [ "$label" != "$source_url" ]; then
+  echo "::error::$tested must carry $label_key=$source_url (found '${label//$'\n'/ }'): GHCR links a new package to its repository from this label. Nothing was pushed."
+  exit 1
+fi
+
 docker tag "$tested" "$image"
 docker push "$image"
 

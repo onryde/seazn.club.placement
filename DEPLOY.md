@@ -109,6 +109,33 @@ as Fly will, so a private package fails it. That red is the check working, not a
 defect. Once the package is public, re-run that `stg` run (Actions, `stg`, the red run,
 *Re-run failed jobs*); nothing in the repository needs to change.
 
+### If the publish step is denied: `permission_denied: write_package`
+
+The `publish` job pushes with the repository's own `GITHUB_TOKEN`, and GHCR lets that
+token write only a package this repository has been granted. The image's
+`org.opencontainers.image.source` label links a package to a repository when the
+package is *created*; it grants nothing on one that already exists. So a denial at
+`docker push` means the package exists and this repository has no Actions access to it
+(for example it was first created from another repository). Look at it:
+
+```bash
+gh api orgs/onryde/packages/container/seazn-placement   # needs the read:packages scope
+```
+
+`repository` names the source repository the package is linked to and `visibility`
+should read `public`. After the fix `repository` (the UI's *Repository source*) may
+still name another repository: here it is `onryde/seazn.club`, because the package was
+first created on 2026-09-09 by seazn.club's build-and-dispatch workflow (commit
+fc5862f888, branch `feat/e2e-image-split`). That link is set by the package's first
+version and is cosmetic; access comes from *Manage Actions access*. Fix it once, in the
+package's settings (GitHub: Packages, `seazn-placement`, Package settings):
+
+1. Untick *Inherit access from source repository*.
+2. Under *Manage Actions access*, add `seazn.club.placement` with the role *Write*.
+3. Check that the visibility is *Public* (step 2 above).
+
+Then re-run the failed `ci` run; nothing in the repository needs to change.
+
 ## 4b. Staging gets its OWN service, `placement-stg` (owner decision 2026-08-11)
 
 **This supersedes the 2026-08-10 decision to share.** Sharing was correct while

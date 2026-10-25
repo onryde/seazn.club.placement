@@ -8,7 +8,8 @@ must not move an existing sha tag, so the script asks the registry first.
 There is no container runtime on the developer machine, so these cases run the
 real script against a FAKE ``docker`` on PATH that records every call and plays
 the registry. What only CI can prove is that real ``docker`` and GHCR answer the
-way the fake does (the ``Digest:`` line of ``buildx imagetools inspect``).
+way the fake does (the ``Digest:`` line of ``buildx imagetools inspect``, and what
+``docker image inspect`` prints for a label the image does not carry).
 """
 
 import os
@@ -26,6 +27,12 @@ IMAGE = "ghcr.io/onryde/seazn-placement:" + "a" * 40
 TESTED = "placement-service:ci"
 DIGEST = "sha256:" + "d" * 64
 OTHER_DIGEST = "sha256:" + "e" * 64
+# The label GHCR reads to link a NEW package to a repository. Typed here, from the
+# repository's own name, never read back from the script under test.
+LABEL_KEY = "org.opencontainers.image.source"
+SOURCE_URL = "https://github.com/onryde/seazn.club.placement"
+# The exact call the script makes to read it: the tested tag, after the load.
+INSPECT_LABEL = 'docker image inspect --format {{ index .Config.Labels "' + LABEL_KEY + '" }} ' + TESTED
 
 FAKE_DOCKER = r"""#!/usr/bin/env bash
 # Records every call. Plays a registry: the sha tag exists if FAKE_EXISTING is
@@ -52,7 +59,18 @@ case "$1" in
     echo "ERROR: ${@: -1}: not found" >&2
     exit 1
     ;;
-  load) [ -z "${FAKE_LOAD_FAILS:-}" ] || exit 1 ;;
+  load) [ -z "${FAKE_LOAD_FAILS:-}" ] || exit 1; touch "$FAKE_STATE/loaded" ;;
+  image)
+    # `docker image inspect --format <template> <image>`. Only the tested tag
+    # exists, and only once `docker load` has run. FAKE_LABEL is what its source
+    # label prints as: docker prints the empty string for a label the image lacks.
+    [ -z "${FAKE_IMAGE_INSPECT_FAILS:-}" ] || { echo "Error: boom" >&2; exit 1; }
+    if [ ! -e "$FAKE_STATE/loaded" ] || [ "${@: -1}" != "$FAKE_LOADED" ]; then
+      echo "Error: No such image: ${@: -1}" >&2
+      exit 1
+    fi
+    printf '%s\n' "$FAKE_LABEL"
+    ;;
   tag) [ -z "${FAKE_TAG_FAILS:-}" ] || exit 1 ;;
   push) [ -z "${FAKE_PUSH_FAILS:-}" ] || exit 1; touch "$FAKE_STATE/pushed" ;;
 esac
@@ -85,6 +103,8 @@ def _run(tmp_path, *args, **fake):
         "FAKE_STATE": str(state),
         "FAKE_DIGEST": DIGEST,
         "FAKE_EXISTING_DIGEST": OTHER_DIGEST,
+        "FAKE_LOADED": TESTED,
+        "FAKE_LABEL": SOURCE_URL,
     }
     env.update({f"FAKE_{key.upper()}": value for key, value in fake.items()})
     result = subprocess.run(
@@ -112,10 +132,12 @@ def test_pushes_the_tested_image_when_the_tag_is_absent(tmp_path):
     result, calls = _standard(tmp_path)
     tar = str(tmp_path / "image.tar")
     assert result.returncode == 0, _output(result)
-    # Exactly this sequence: ask, load the tested tar, tag, push, read back.
+    # Exactly this sequence: ask, load the tested tar, check its label, tag, push,
+    # read back.
     assert calls == [
         f"docker buildx imagetools inspect {IMAGE}",
         f"docker load --input {tar}",
+        INSPECT_LABEL,
         f"docker tag {TESTED} {IMAGE}",
         f"docker push {IMAGE}",
         f"docker buildx imagetools inspect {IMAGE}",
@@ -161,11 +183,109 @@ def test_a_failed_push_stops_the_script_at_the_push(tmp_path):
     assert DIGEST not in result.stdout
 
 
-def test_a_failed_load_never_reaches_tag_or_push(tmp_path):
+def test_a_failed_load_never_reaches_the_label_check_tag_or_push(tmp_path):
     result, calls = _standard(tmp_path, load_fails="1")
     assert any(call.startswith("docker load ") for call in calls), calls
-    assert not any(call.startswith(("docker tag ", "docker push ")) for call in calls), calls
+    assert not any(call.startswith(("docker image ", "docker tag ", "docker push ")) for call in calls), calls
     assert result.returncode != 0, _output(result)
+
+
+# --- the image must say which repository it belongs to ------------------------
+#
+# GHCR reads the image's org.opencontainers.image.source label to link a new
+# package to its repository (GitHub recommends it). The script reads it off the
+# loaded image and stops before the tag and the push when it is not exactly this
+# repository's: a precheck against a build that drops the label. It is NOT a
+# cure or a diagnosis for `permission_denied: write_package`, which an existing
+# package gives a repository that has no Actions access to it, label or not
+# (DEPLOY.md, §4).
+
+# What `docker image inspect --format '{{ index .Config.Labels "..." }}'` can print
+# for an image that does NOT carry this repository's label. Each is one way to
+# miss; the right value is SOURCE_URL.
+WRONG_LABELS = {
+    "absent label prints nothing": "",
+    "unset value": "<no value>",
+    "another repository of the same owner": "https://github.com/onryde/seazn.club",
+    "the app repository": "https://github.com/onryde/seazn.club.placement-app",
+    "another owner": "https://github.com/someone/seazn.club.placement",
+    "owner in another case": "https://github.com/Onryde/seazn.club.placement",
+    "owner only": "https://github.com/onryde",
+    "trailing slash": SOURCE_URL + "/",
+    "dot git": SOURCE_URL + ".git",
+    "plain http": SOURCE_URL.replace("https://", "http://"),
+    "leading space": " " + SOURCE_URL,
+    "trailing space": SOURCE_URL + " ",
+    "the ssh form": "git@github.com:onryde/seazn.club.placement.git",
+}
+
+
+@pytest.mark.parametrize("label", list(WRONG_LABELS.values()), ids=list(WRONG_LABELS))
+def test_an_image_without_this_repos_source_label_is_never_tagged_or_pushed(tmp_path, label):
+    tar = str(tmp_path / "image.tar")
+    result, calls = _standard(tmp_path, label=label)
+    out = _output(result)
+    # It stops AT the label check: loaded, read, nothing after.
+    assert calls == [
+        f"docker buildx imagetools inspect {IMAGE}",
+        f"docker load --input {tar}",
+        INSPECT_LABEL,
+    ], calls
+    assert result.returncode == 1, out
+    assert not (tmp_path / "state" / "pushed").exists()
+    # One annotation that says what is wrong, what was expected, and what was found.
+    errors = [line for line in out.splitlines() if line.startswith("::error::")]
+    assert len(errors) == 1, out
+    for needle in (TESTED, LABEL_KEY, SOURCE_URL):
+        assert needle in errors[0], (needle, errors[0])
+    if label:
+        assert f"'{label}'" in errors[0], (label, errors[0])
+    assert DIGEST not in result.stdout
+
+
+def test_an_image_with_this_repos_source_label_is_pushed(tmp_path):
+    # The positive pair of the cases above: the same run with the right label
+    # reaches the push, so the refusals are the label's doing and nothing else's.
+    result, calls = _standard(tmp_path, label=SOURCE_URL)
+    assert result.returncode == 0, _output(result)
+    assert f"docker push {IMAGE}" in calls, calls
+    assert "::error::" not in _output(result)
+    # And the label was read BEFORE anything was tagged or pushed.
+    assert INSPECT_LABEL in calls, calls
+    read = calls.index(INSPECT_LABEL)
+    assert read < calls.index(f"docker tag {TESTED} {IMAGE}") < calls.index(f"docker push {IMAGE}"), calls
+
+
+def test_a_label_that_cannot_be_read_is_an_error_and_never_pushes(tmp_path):
+    # docker itself fails (the image is not there, the daemon is gone): that is not
+    # "the label is fine".
+    tar = str(tmp_path / "image.tar")
+    result, calls = _standard(tmp_path, image_inspect_fails="1")
+    out = _output(result)
+    assert calls == [
+        f"docker buildx imagetools inspect {IMAGE}",
+        f"docker load --input {tar}",
+        INSPECT_LABEL,
+    ], calls
+    assert result.returncode == 1, out
+    errors = [line for line in out.splitlines() if line.startswith("::error::")]
+    assert len(errors) == 1 and TESTED in errors[0], out
+    # It says the label could not be READ, not that it is the wrong one: an
+    # unreadable label that was shrugged off as "" would still stop the push, but
+    # with a wrong diagnosis.
+    assert "cannot read" in errors[0] and "must carry" not in errors[0], errors[0]
+    assert not (tmp_path / "state" / "pushed").exists()
+
+
+def test_the_label_is_read_off_the_loaded_tested_tag_not_the_published_one(tmp_path):
+    # The fake only knows the tested tag, and only after the load. A check that
+    # asked about the published name (which does not exist until `docker tag`), or
+    # ran before the load, would see "No such image" and fail the run below.
+    result, calls = _standard(tmp_path)
+    assert result.returncode == 0, _output(result)
+    asked = [call for call in calls if call.startswith("docker image ")]
+    assert asked == [INSPECT_LABEL], asked
+    assert asked[0].endswith(f" {TESTED}") and IMAGE not in asked[0], asked
 
 
 def test_pushes_only_the_tag_it_was_given(tmp_path):
@@ -320,6 +440,7 @@ def test_an_inspect_error_that_means_absent_publishes(tmp_path, error):
     assert calls == [
         f"docker buildx imagetools inspect {IMAGE}",
         f"docker load --input {tar}",
+        INSPECT_LABEL,
         f"docker tag {TESTED} {IMAGE}",
         f"docker push {IMAGE}",
         f"docker buildx imagetools inspect {IMAGE}",
@@ -341,10 +462,10 @@ def test_a_transient_error_then_not_found_publishes(tmp_path):
     result, calls = _standard(
         tmp_path, inspect_err="ERROR: 503 Service Unavailable", inspect_err_times="1"
     )
-    # inspect (503), inspect (not found), load, tag, push, read-back.
+    # inspect (503), inspect (not found), load, label check, tag, push, read-back.
     # (After the push the fake registry holds the tag.)
     assert result.returncode == 0, _output(result)
-    assert [call.split()[1] for call in calls] == ["buildx", "buildx", "load", "tag", "push", "buildx"], calls
+    assert [call.split()[1] for call in calls] == ["buildx", "buildx", "load", "image", "tag", "push", "buildx"], calls
 
 
 def test_a_sha_made_of_status_digits_does_not_turn_an_unrecognised_error_into_not_found(tmp_path):
