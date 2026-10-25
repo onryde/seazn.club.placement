@@ -73,3 +73,32 @@ lsof -t -i :50051            # prints nothing once it's actually down
 If `lsof -t -i :50051` prints a PID *before* you start your own server, that
 port is already occupied by something else's process — do not assume it is
 safe to reuse; find out whose it is first.
+
+## Installing buf
+
+`tests/test_buf_breaking.py` runs the real `buf` and FAILS (never skips) when it
+is missing or is not the pinned version. `BUF_VERSION` in
+`.github/workflows/ci.yml` is the only place that version is written. Download
+that release's binary into a directory outside the repo, verify it against the
+release's `sha256.txt`, and put the directory on `PATH` for the test run only:
+
+```bash
+# from the repo root; nothing on your machine's PATH changes
+BUF_VERSION=$(sed -n 's/^  BUF_VERSION: "\(.*\)"$/\1/p' .github/workflows/ci.yml)
+BUF_DIR=$(mktemp -d)
+ASSET="buf-$(uname -s)-$(uname -m)"   # buf-Darwin-arm64, buf-Darwin-x86_64, buf-Linux-x86_64, ...
+RELEASE="https://github.com/bufbuild/buf/releases/download/v$BUF_VERSION"
+curl -fsSL -o "$BUF_DIR/$ASSET" "$RELEASE/$ASSET"
+curl -fsSL -o "$BUF_DIR/sha256.txt" "$RELEASE/sha256.txt"
+(cd "$BUF_DIR" && grep " $ASSET\$" sha256.txt | shasum -a 256 -c -)
+mv "$BUF_DIR/$ASSET" "$BUF_DIR/buf" && chmod +x "$BUF_DIR/buf"
+"$BUF_DIR/buf" --version   # must print $BUF_VERSION
+```
+
+Then run pytest from the same shell (or after `export BUF_DIR=...`) with
+`PATH="${BUF_DIR:+$BUF_DIR:}$PATH"`, as shown in `AGENTS.md`. Keep the
+`${BUF_DIR:+...}` form: a bare `$BUF_DIR:` prefix, with `BUF_DIR` unset, adds an
+empty entry (the current directory) to `PATH`.
+
+To bump the version, edit `BUF_VERSION` in `ci.yml` (newest buf release that is
+at least two weeks old: `gh release list -R bufbuild/buf --limit 5`) and reinstall.

@@ -1,0 +1,13 @@
+# buf CLI v2 config. Used ONLY for `buf breaking` (scripts/buf-breaking.sh and
+# ci.yml's buf-breaking job); there is no lint, format or BSR use here.
+#
+# FILE is the strictest breaking category: it also catches a rename or a move of
+# a message or a package, which the generated TypeScript stubs in seazn.club
+# (ts-proto) would see as a different type even when the wire bytes agree.
+# proto/scheduler.proto is additive-only (AGENTS.md, "The proto rule").
+version: v2
+modules:
+  - path: proto
+breaking:
+  use:
+    - FILE
