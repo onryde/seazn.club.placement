@@ -1,0 +1,123 @@
+name: prod
+
+# Deploys the image ci.yml already published for the tagged commit to production.
+# It does not build one.
+#
+# A v*.*.* release tag only. Placement prod moves on a tag in THIS repository;
+# seazn.club's release tag no longer deploys it.
+#
+# The tag does not run ci.yml, so a tag alone proves nothing about the commit. What
+# proves it is the image: ci.yml publishes ghcr.io/onryde/seazn-placement:<sha> only
+# on a push to main, after test, docker and buf-breaking have all passed, and the
+# image is the very one the docker job tested. So the first thing this job does is
+# require that image for the tagged commit and FAIL if there is none (a tag on a
+# commit that never passed main, or one whose ci is still running: wait, then
+# re-run). The deploy then ships that image; nothing is rebuilt.
+#
+# No paths filter: a release tag is a deliberate "ship what is on main right now"
+# act, not a narrow per-PR signal, and the whole repository is the service.
+#
+# `fly scale count` is NOT run here. Machine count is deployment SHAPE, set
+# once by hand (DEPLOY.md step 5); a deploy rolls existing machines and
+# preserves the count. If a deploy ever resets it, that is a bug worth
+# seeing rather than papering over with a scale call on every push — hence
+# the reporting step at the end, which notices but does not fail.
+#
+# INTERNAL ONLY. The placement service is reached over Fly private networking
+# (placement.flycast:50051) and nothing else. The deploy passes --no-public-ips,
+# so it can never allocate an address, and the step after it fails the job if
+# `flyctl ips list` shows anything but a private v6.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+# Least privilege for GITHUB_TOKEN. The job reads the repo to check it out; it
+# calls no GitHub API. Its one credential is FLY_TOKEN, and only the steps that run
+# flyctl are given it.
+permissions:
+  contents: read
+
+env:
+  # The ONE place flyctl's version is written (stg.yml carries the same line, and
+  # tests/test_deploy_wiring.py fails if they differ). Pinning the action's commit
+  # alone would still install whatever flyctl is newest on the day. Bump it to the
+  # newest release that is at least two weeks old:
+  #   gh release list -R superfly/flyctl --limit 12
+  FLYCTL_VERSION: "0.4.115"
+
+jobs:
+  deploy:
+    name: Deploy to fly (production)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Serialise: a second tag must not race a rollout mid-flight.
+    concurrency:
+      group: placement-deploy
+      cancel-in-progress: false
+    env:
+      # On a tag push github.sha is the tagged commit.
+      IMAGE: ghcr.io/onryde/seazn-placement:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # v1
+        with:
+          version: ${{ env.FLYCTL_VERSION }}
+
+      # The app name is read from fly.toml and ASSERTED, not hardcoded and not
+      # trusted. Fly's private DNS derives from it and `packages/scheduler/src/placement-client.ts`'s
+      # DEFAULT_HOST is the literal "placement.flycast:50051" — if the two ever
+      # drift, every solve dials a host that does not exist, `build.ts` falls
+      # back to greedy, and the symptom is "the optimiser got worse" rather
+      # than any error. Failing the deploy is much cheaper than debugging that.
+      - name: Read and verify the app name
+        id: flycfg
+        run: |
+          app="$(sed -n 's/^[[:space:]]*app[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' fly.toml | head -1)"
+          if [ -z "$app" ]; then
+            echo "::error::no app name in fly.toml"
+            exit 1
+          fi
+          if [ "$app" != "placement" ]; then
+            echo "::error::fly.toml app is '$app', expected 'placement' — packages/scheduler/src/placement-client.ts's DEFAULT_HOST is placement.flycast:50051 and would no longer resolve"
+            exit 1
+          fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+
+      # No login: Fly pulls the image anonymously, so this must see what Fly sees.
+      - name: Require the image ci published for the tagged commit
+        run: bash scripts/require-image.sh "$IMAGE"
+
+      # --image: Fly runs the published image as it is. Without it flyctl would
+      # build a new one from this checkout, which is the untested build this
+      # workflow exists to avoid. --no-public-ips: a deploy must never allocate
+      # an address (the placement service is internal only).
+      - name: Deploy the published image
+        run: |
+          flyctl deploy \
+            --app "$APP" \
+            --config fly.toml \
+            --image "$IMAGE" \
+            --no-public-ips
+        env:
+          APP: ${{ steps.flycfg.outputs.app }}
+          FLY_API_TOKEN: ${{ secrets.FLY_TOKEN }}
+
+      - name: Fail on any address that is not a private v6
+        run: python3 scripts/require-private-ips.py "$APP"
+        env:
+          APP: ${{ steps.flycfg.outputs.app }}
+          FLY_API_TOKEN: ${{ secrets.FLY_TOKEN }}
+
+      # Reports, never blocks. Machine count is owner-managed shape, and a
+      # mismatch should be visible without failing a deploy that already
+      # passed every correctness gate.
+      - name: Report machine count
+        if: always()
+        run: |
+          flyctl status --app "$APP" || true
+          echo "::notice::DEPLOY.md step 5 sets 'fly scale count 10'. If the count above is not 10, the fan-out that makes hard_limit=1 useful is not in place."
+        env:
+          APP: ${{ steps.flycfg.outputs.app }}
+          FLY_API_TOKEN: ${{ secrets.FLY_TOKEN }}

@@ -40,9 +40,10 @@ ALLOWED_ACTIONS = {
     "docker/setup-buildx-action",
     "docker/build-push-action",
     "docker/login-action",
+    "superfly/flyctl-actions/setup-flyctl",
 }
 USES_LINE = re.compile(r"^\s*(?:- )?uses:")
-USES_PINNED = re.compile(r"^\s*(?:- )?uses: ([\w.-]+/[\w.-]+)@([0-9a-f]{40}) # v\d+(?:\.\d+){0,2}$")
+USES_PINNED = re.compile(r"^\s*(?:- )?uses: ([\w.-]+/[\w.-]+(?:/[\w.-]+)?)@([0-9a-f]{40}) # v\d+(?:\.\d+){0,2}$")
 EXPECTED_TIMEOUTS = {"test": 30, "docker": 20, "buf-breaking": 10, "publish": 10}
 
 

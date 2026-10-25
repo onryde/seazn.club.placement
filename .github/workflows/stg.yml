@@ -1,0 +1,156 @@
+name: stg
+
+# Deploys the image ci.yml just tested to placement-stg. It does not build one.
+#
+# ci.yml, on every push to main, builds the image once, smoke-tests it and (after
+# every gate) publishes THAT image as ghcr.io/onryde/seazn-placement:<commit sha>.
+# When that run finishes green, this workflow deploys that commit's published
+# image: the bytes that were tested are the bytes that ship, and nothing here can
+# resolve a floating dependency or a base image tag a second time.
+#
+# The trigger is workflow_run, not `needs:`. `needs:` only resolves inside ONE
+# workflow run, so a job in this file cannot wait on a job in ci.yml: across files
+# it is a silent no-op, not a validation error (seazn.club's toolchain test says
+# so). tests/test_deploy_wiring.py therefore fails on any `needs:` here, and the
+# gate below is the whole contract:
+#
+#   * ci finished with conclusion `success`,
+#   * for a `push` (never a pull_request: workflow_run runs with this repo's
+#     secrets even for a fork's pull request, whose head_branch can be named main),
+#   * to `main`, in THIS repository.
+#
+# No paths filter: the whole repository is the service.
+#
+# STAGING FOLLOWS THE TIP OF MAIN. Two pushes can finish ci out of order, and the
+# older one would then deploy over the newer. Right before it deploys, the job asks
+# origin where main is; if it has moved on, this commit is skipped (a notice, not a
+# failure) and the newer commit's own run deploys that one.
+#
+# Production is a separate workflow (prod.yml) and moves only on a v*.*.* tag in
+# this repository, so staging runs ahead of it. The gap between "merged to main"
+# and "tagged" IS the rehearsal window. The intended sequence:
+#
+#   1. merge the PR; ci publishes the image and this workflow deploys it to
+#      placement-stg
+#   2. exercise it on stg.seazn.club, confirming the per-solve log line appears
+#      in `placement-stg` and NOT in `placement`
+#   3. only then push a release tag, letting prod.yml ship THE SAME image
+#
+# Between 1 and 3 the two services can run DIFFERENT contracts. That is the point,
+# and it is why proto changes must be additive: proto3 makes an added field safe in
+# both directions, a renumbered or repurposed one is not, and no workflow step can
+# save you from that.
+#
+# INTERNAL ONLY. The placement service is reached over Fly private networking
+# (placement-stg.flycast:50051) and nothing else. The deploy passes --no-public-ips,
+# so it can never allocate an address, and the step after it fails the job if
+# `flyctl ips list` shows anything but a private v6.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+# Least privilege for GITHUB_TOKEN. The job reads the repo to check it out; it
+# calls no GitHub API, so there is no `actions: read` either. Its one credential
+# is FLY_TOKEN, and only the steps that run flyctl are given it.
+permissions:
+  contents: read
+
+env:
+  # The ONE place flyctl's version is written (prod.yml carries the same line, and
+  # tests/test_deploy_wiring.py fails if they differ). Pinning the action's commit
+  # alone would still install whatever flyctl is newest on the day. Bump it to the
+  # newest release that is at least two weeks old:
+  #   gh release list -R superfly/flyctl --limit 12
+  FLYCTL_VERSION: "0.4.115"
+
+jobs:
+  deploy-stg:
+    name: Deploy to placement-stg
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Its OWN group. A staging deploy must never queue behind, or cancel, a
+    # production rollout — and, symmetrically, must not be cancelled
+    # mid-flight by the next merge either (a killed `flyctl deploy` can leave
+    # a rollout half-applied).
+    concurrency:
+      group: placement-stg-deploy
+      cancel-in-progress: false
+    env:
+      # The commit ci tested, not the default branch's head: on workflow_run,
+      # github.sha is the latter. Values from the triggering run reach a script
+      # only through env, never interpolated into a `run:` block.
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      IMAGE: ghcr.io/onryde/seazn-placement:${{ github.event.workflow_run.head_sha }}
+    steps:
+      # Check out the SAME commit the image was built from: fly.toml is read from
+      # here, and a plain checkout on workflow_run would give the default branch.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # v1
+        with:
+          version: ${{ env.FLYCTL_VERSION }}
+
+      # The app name is OVERRIDDEN, not read — and this is the one place in
+      # the repo where that is correct. `fly.toml` says `app = "placement"`
+      # because staging deploys the SAME config with `--app placement-stg`
+      # (deliberately: a forked TOML would drift and make staging a worse
+      # rehearsal for the thing it exists to rehearse).
+      #
+      # The assertion below is therefore the mirror image of prod.yml's:
+      # it fails if `fly.toml` has been renamed to something else, because
+      # that would mean either the production DEFAULT_HOST is broken or
+      # someone has forked the config after all. Either way this job's override
+      # would be resting on an assumption that no longer holds.
+      - name: Verify fly.toml still names the production app
+        run: |
+          app="$(sed -n 's/^[[:space:]]*app[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' fly.toml | head -1)"
+          if [ "$app" != "placement" ]; then
+            echo "::error::fly.toml app is '$app', expected 'placement'. This job deploys that same config with --app placement-stg; if the file has been renamed or forked, that override is no longer the right thing to do."
+            exit 1
+          fi
+
+      # No login: Fly pulls the image anonymously, so this must see what Fly sees.
+      - name: Require the image ci published for this commit
+        run: bash scripts/require-image.sh "$IMAGE"
+
+      - name: Skip a commit that main has already moved past
+        id: tip
+        run: bash scripts/require-main-tip.sh "$HEAD_SHA"
+
+      # --image: Fly runs the published image as it is. Without it flyctl would
+      # build a new one from this checkout, which is the untested build this
+      # workflow exists to avoid. --no-public-ips: a deploy must never allocate
+      # an address (the placement service is internal only).
+      - name: Deploy the published image to placement-stg
+        if: steps.tip.outputs.current == 'true'
+        run: |
+          flyctl deploy \
+            --app placement-stg \
+            --config fly.toml \
+            --image "$IMAGE" \
+            --no-public-ips
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_TOKEN }}
+
+      - name: Fail on any address that is not a private v6
+        if: steps.tip.outputs.current == 'true'
+        run: python3 scripts/require-private-ips.py placement-stg
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_TOKEN }}
+
+      # The check that actually matters, and it cannot be automated from here:
+      # a missing or misspelled PLACEMENT_SERVICE_HOST on `seazn-club-stg`
+      # leaves staging calling PRODUCTION, which looks identical to success.
+      - name: What to verify by hand
+        if: always() && steps.tip.outputs.current == 'true'
+        run: |
+          flyctl status --app placement-stg || true
+          echo "::notice::Deployed ${IMAGE} to placement-stg."
+          echo "::notice::VERIFY BY LOG ATTRIBUTION, not by reading the env var: run one Auto-schedule on stg.seazn.club, then 'fly logs --app placement-stg' must show a 'solve request=' line and 'fly logs --app placement' must show NOTHING for it. A misspelled PLACEMENT_SERVICE_HOST on seazn-club-stg silently routes staging to production."
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_TOKEN }}
