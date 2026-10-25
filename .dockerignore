@@ -18,3 +18,5 @@ build/
 **/.pytest_cache/
 venv/
 .venv/
+# The checkout's .git (and anything its config holds) never enters the build context.
+.git

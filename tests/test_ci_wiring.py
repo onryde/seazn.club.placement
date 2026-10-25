@@ -1,5 +1,5 @@
 """Pins on ``.github/workflows/*.yml``: who may write packages, what publishes,
-which image tag exists, and what the buf gate is given.
+which image tag exists, which actions run and what the buf gate is given.
 
 These are pure text reads. There is no YAML library in this project's
 dependencies and none is wanted: the pins below are about literal lines
@@ -9,7 +9,8 @@ or the old repo layout counts for nothing. Jobs are split on
 ``^  ([a-z0-9-]+):$`` under ``jobs:``.
 
 Every sweep reports what it scanned and a count of zero is a FAILURE
-(docs/superpowers/TEST-STRATEGY.md, anti-vacuity).
+(seazn.club's TEST-STRATEGY.md, see AGENTS.md, "Paths in comments": anti-vacuity).
+Floors are derived from the files, never typed in.
 """
 
 import re
@@ -21,9 +22,28 @@ JOB_HEADER = re.compile(r"^  ([a-z0-9-]+):[ \t]*$", re.MULTILINE)
 
 IMAGE_REPO = "ghcr.io/onryde/seazn-placement"
 SOURCE_LABEL = "org.opencontainers.image.source=https://github.com/onryde/seazn.club.placement"
+TAR_PATH = "${{ runner.temp }}/placement-image.tar"
+TESTED_TAG = "placement-service:ci"
 # Assembled from pieces so tests/test_repo_layout.py's sweep does not match this file.
 OLD_SERVICE_DIR = "services/" "placement"
 DESELECT_RE = re.compile(r"--deselect (tests/[\w/.]+\.py)::(\w+)")
+
+# Every action any workflow here may use. Equality, not subset: an unused entry
+# is stale and an unlisted action is unreviewed. A workflow that needs another
+# action adds it here, pinned, in the same change.
+ALLOWED_ACTIONS = {
+    "actions/checkout",
+    "actions/setup-python",
+    "actions/upload-artifact",
+    "actions/download-artifact",
+    "bufbuild/buf-action",
+    "docker/setup-buildx-action",
+    "docker/build-push-action",
+    "docker/login-action",
+}
+USES_LINE = re.compile(r"^\s*(?:- )?uses:")
+USES_PINNED = re.compile(r"^\s*(?:- )?uses: ([\w.-]+/[\w.-]+)@([0-9a-f]{40}) # v\d+$")
+EXPECTED_TIMEOUTS = {"test": 30, "docker": 20, "buf-breaking": 10, "publish": 10}
 
 
 def _code(text):
@@ -58,6 +78,12 @@ def _steps(block):
     assert after_steps, "job has no steps"
     parts = re.split(r"(?m)^      - ", after_steps)
     return ["      - " + part for part in parts[1:]]
+
+
+def _step_using(block, action):
+    found = [s for s in _steps(block) if re.search(rf"uses: {re.escape(action)}@", s)]
+    assert len(found) == 1, f"expected exactly one {action} step, found {len(found)}"
+    return found[0]
 
 
 def _run_bodies(block):
@@ -135,42 +161,96 @@ def test_publish_runs_only_on_main_after_every_gate():
 def test_only_publish_logs_in_and_pushes():
     code, jobs = _ci()
     assert _count("docker/login-action", code) == 1 and "docker/login-action" in jobs["publish"]
-    assert _count("secrets.GITHUB_TOKEN", code) == 1 and "secrets.GITHUB_TOKEN" in jobs["publish"]
-    assert _count("push: true", code) == 1 and "push: true" in jobs["publish"]
-    assert "push: false" in jobs["docker"] and "push: true" not in jobs["docker"]
+    # The only credential in the file is the job's own token, and only the login step reads it.
+    assert re.findall(r"secrets\.\w+", code) == ["secrets.GITHUB_TOKEN"], re.findall(r"secrets\.\w+", code)
+    assert "secrets.GITHUB_TOKEN" in jobs["publish"]
+    assert "github.token" not in code, "an alias of the job token would dodge the count above"
     assert "registry: ghcr.io" in jobs["publish"]
+    # build-push-action never pushes. The one push is `docker push` in the
+    # publish script, and nothing but the publish job runs that script.
+    assert "push: true" not in code
+    assert "push: false" in jobs["docker"]
+    assert [job for job, block in jobs.items() if "scripts/publish-image.sh" in block] == ["publish"]
 
 
-# --- the one image ------------------------------------------------------------
+# --- the one image: built once, tested, then pushed ----------------------------
 
 
 def test_image_is_the_sha_tag_only():
     code, jobs = _ci()
     sha_tag = f"{IMAGE_REPO}:${{{{ github.sha }}}}"
     assert _count(sha_tag, code) == 1 and sha_tag in jobs["publish"], "the sha tag must appear once, in publish"
-    # Every reference to the image name, whatever follows it, is the sha tag.
-    tags = re.findall(r"seazn-placement:(\$\{\{ github\.sha \}\}|\S*)", code)
-    assert tags == ["${{ github.sha }}"], tags
+    # EVERY mention of the image name carries the sha tag. A bare name pushes an
+    # implicit :latest, so it is checked on the name, not on a following colon.
+    assert _count("seazn-placement", code) == 1
+    assert re.findall(r"seazn-placement(?!:\$\{\{ github\.sha \}\})", code) == []
     assert not re.search(r"(?<![-\w])latest\b", code), "no 'latest' anywhere (ubuntu-latest excepted)"
     assert "docker/metadata-action" not in code, "metadata-action derives extra tags (latest, branch)"
-    assert not re.search(r"seazn-placement:(main|master|latest)", code)
 
 
 def test_image_links_to_this_repo():
     code, jobs = _ci()
     assert _count(SOURCE_LABEL, code) == 1, "the source label must appear exactly once"
-    assert re.search(rf"^          labels: {re.escape(SOURCE_LABEL)}$", jobs["publish"], re.MULTILINE), (
-        "the label belongs under 'labels:' of the publish build step"
-    )
+    # The label is baked into the image the docker job builds and tests; the
+    # publish job pushes that image, it does not build one.
+    build = _step_using(jobs["docker"], "docker/build-push-action")
+    assert re.search(rf"^          labels: {re.escape(SOURCE_LABEL)}$", build, re.MULTILINE), build
 
 
-def test_publish_reports_the_pushed_digest():
+def test_docker_exports_the_tested_image_and_publish_pushes_that_one():
     _, jobs = _ci()
-    publish = jobs["publish"]
-    assert re.search(r"^        id: build$", publish, re.MULTILINE)
-    assert "DIGEST: ${{ steps.build.outputs.digest }}" in publish
-    # An empty digest must fail the job, not print an empty line.
-    assert re.search(r'test -n "\$DIGEST"', publish) and "::error::" in publish
+    docker, publish = jobs["docker"], jobs["publish"]
+
+    build = _step_using(docker, "docker/build-push-action")
+    assert f"          outputs: type=docker,dest={TAR_PATH}\n" in build, build
+    assert f"          tags: {TESTED_TAG}\n" in build, build
+    assert "          load:" not in build, "load: true conflicts with an exported tar"
+    assert "          push: false\n" in build
+
+    # The smoke steps run on the loaded tar, i.e. on the bytes that are exported.
+    load = [i for i, s in enumerate(_steps(docker)) if 'docker load --input "$RUNNER_TEMP/placement-image.tar"' in s]
+    runs = [i for i, s in enumerate(_steps(docker)) if "docker run" in s]
+    assert len(load) == 1 and runs and load[0] < min(runs), (load, runs)
+
+    upload = _step_using(docker, "actions/upload-artifact")
+    assert "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" in upload, upload
+    assert f"          path: {TAR_PATH}\n" in upload and "if-no-files-found: error" in upload, upload
+    artifact = re.search(r"^          name: (\S+)$", upload, re.MULTILINE).group(1)
+
+    # publish takes that artifact; it builds nothing.
+    assert "docker/build-push-action" not in publish and "docker/setup-buildx-action" not in publish
+    download = _step_using(publish, "actions/download-artifact")
+    assert f"          name: {artifact}\n" in download and "          path: ${{ runner.temp }}\n" in download, download
+
+    steps = _steps(publish)
+    index = {
+        "download": next(i for i, s in enumerate(steps) if "download-artifact" in s),
+        "login": next(i for i, s in enumerate(steps) if "docker/login-action" in s),
+        "push": next(i for i, s in enumerate(steps) if "scripts/publish-image.sh" in s),
+    }
+    assert index["download"] < index["push"] and index["login"] < index["push"], index
+    push = steps[index["push"]]
+    assert 'run: bash scripts/publish-image.sh "$TAR" "$TESTED" "$IMAGE"' in push, push
+    assert f"          TAR: {TAR_PATH}\n" in push and f"          TESTED: {TESTED_TAG}\n" in push, push
+    assert f"{IMAGE_REPO}:${{{{ github.sha }}}}" in publish
+
+
+def test_every_checkout_drops_its_credentials():
+    # The persisted token would sit in .git/config; only buf-breaking needs git
+    # history, and nothing here pushes with it.
+    checked = 0
+    for name, text in _workflows().items():
+        for job, block in _jobs(_code(text)).items():
+            for step in _steps(block):
+                if "actions/checkout@" in step:
+                    checked += 1
+                    assert "persist-credentials: false" in step, f"{name}:{job}: {step}"
+    assert checked == sum(_count("actions/checkout@", _code(t)) for t in _workflows().values()) > 0
+
+
+def test_dockerignore_keeps_git_out_of_the_build_context():
+    lines = (REPO_ROOT / ".dockerignore").read_text().splitlines()
+    assert ".git" in lines, "the build context would carry .git (and any credential in its config)"
 
 
 # --- what the buf gate is given -------------------------------------------------
@@ -197,25 +277,32 @@ def test_buf_job_has_full_history():
 def test_no_expression_is_interpolated_into_a_run_block():
     # The base ref reaches the script through env, never through the shell text.
     checked = 0
+    expected = 0
     for name, text in _workflows().items():
-        for job, block in _jobs(_code(text)).items():
+        code = _code(text)
+        expected += len(re.findall(r"^\s*(?:- )?run:", code, re.MULTILINE))
+        for job, block in _jobs(code).items():
             for body in _run_bodies(block):
                 checked += 1
                 assert "${{" not in body, f"{name}:{job}: expression inside a run block:\n{body}"
-    assert checked >= 5, f"only {checked} run blocks were scanned"
+    assert checked == expected > 0, (checked, expected)
 
 
-def test_buf_is_pinned_once_and_both_users_take_it_from_env():
+def test_buf_is_pinned_once_with_its_checksum_and_both_users_take_it_from_env():
     code, jobs = _ci()
     env = _top_block(code, "env")
-    assert re.findall(r'^  (\w+):', env, re.MULTILINE) == ["BUF_VERSION"], env
+    assert re.findall(r"^  (\w+):", env, re.MULTILINE) == ["BUF_VERSION", "BUF_SHA256_LINUX_X86_64"], env
     assert re.search(r'^  BUF_VERSION: "\d+\.\d+\.\d+"$', env, re.MULTILINE), env
+    # sha256 of buf-Linux-x86_64 from that release's sha256.txt; buf-action
+    # verifies the binary it installs against it. Bump the two together.
+    assert re.search(r'^  BUF_SHA256_LINUX_X86_64: "[0-9a-f]{64}"$', env, re.MULTILINE), env
     users = {job: block for job, block in jobs.items() if "bufbuild/buf-action" in block}
     assert sorted(users) == ["buf-breaking", "test"], sorted(users)
     for job, block in users.items():
-        assert _count("bufbuild/buf-action@v1", block) == 1, job
+        assert _count("bufbuild/buf-action@", block) == 1, job
         assert "setup_only: true" in block, f"{job}: buf-action must only install buf"
         assert "version: ${{ env.BUF_VERSION }}" in block, job
+        assert "checksum: ${{ env.BUF_SHA256_LINUX_X86_64 }}" in block, job
 
 
 def test_the_test_job_installs_buf_before_pytest():
@@ -251,33 +338,61 @@ def test_blocking_pytest_deselects_exactly_the_load_sensitive_test():
 
 def test_docker_job_builds_the_root_dockerfile_without_pushing():
     _, jobs = _ci()
-    block = jobs["docker"]
-    for line in ("context: .", "file: Dockerfile", "push: false", "load: true", "tags: placement-service:ci"):
-        assert re.search(rf"^          {re.escape(line)}$", block, re.MULTILINE), line
-    assert "docker run --rm placement-service:ci" in block
-    assert "Container starts and the port accepts a TCP connection" in block
+    build = _step_using(jobs["docker"], "docker/build-push-action")
+    for line in ("context: .", "file: Dockerfile", "push: false"):
+        assert re.search(rf"^          {re.escape(line)}$", build, re.MULTILINE), line
+    assert "docker run --rm placement-service:ci" in jobs["docker"]
+    assert "Container starts and the port accepts a TCP connection" in jobs["docker"]
 
 
-# --- triggers and layout ---------------------------------------------------------------
+# --- actions, triggers, limits and layout ------------------------------------------------
+
+
+def test_every_action_is_sha_pinned_and_on_the_allowlist():
+    found = []
+    expected = 0
+    for name, text in _workflows().items():
+        for number, line in enumerate(_code(text).splitlines(), 1):
+            if not USES_LINE.match(line):
+                continue
+            expected += 1
+            match = USES_PINNED.match(line)
+            assert match, f"{name}:{number}: not '@<40-hex sha> # vN': {line.strip()}"
+            found.append(match.group(1))
+    assert len(found) == expected > 0, (len(found), expected)
+    assert set(found) == ALLOWED_ACTIONS, (sorted(set(found) - ALLOWED_ACTIONS), sorted(ALLOWED_ACTIONS - set(found)))
 
 
 def test_triggers_and_concurrency():
     code, _ = _ci()
     on = _top_block(code, "on")
+    assert set(re.findall(r"^  (\w+):", on, re.MULTILINE)) == {"pull_request", "push"}, on
     assert re.search(r"^  pull_request:\n", on, re.MULTILINE), on
     assert re.search(r"^  push:\n    branches: \[main\]\n", on, re.MULTILINE), on
     assert "pull_request_target" not in code, "pull_request_target hands fork PRs a write token"
     concurrency = _top_block(code, "concurrency")
-    assert "group: placement-ci-${{ github.ref }}" in concurrency
+    # A push is keyed on its own sha: a newer push must not cancel or replace a
+    # pending run, or a middle commit never gets its image.
+    assert "group: placement-ci-${{ github.event_name == 'push' && github.sha || github.ref }}" in concurrency
     # Cancelling a push-to-main run would abandon a publish half way.
     assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in concurrency
 
 
+def test_every_job_has_a_timeout():
+    _, jobs = _ci()
+    found = {job: re.findall(r"^    timeout-minutes: (\d+)$", block, re.MULTILINE) for job, block in jobs.items()}
+    assert {job: [int(v) for v in values] for job, values in found.items()} == {
+        job: [minutes] for job, minutes in EXPECTED_TIMEOUTS.items()
+    }, found
+
+
 def test_no_old_layout_paths():
     scanned = 0
+    expected = 0
     for name, text in _workflows().items():
+        expected += len([line for line in text.splitlines() if not line.lstrip().startswith("#")])
         for number, line in enumerate(_code(text).splitlines(), 1):
             scanned += 1
             assert OLD_SERVICE_DIR not in line, f"{name}:{number}: {line.strip()}"
             assert "working-directory" not in line, f"{name}:{number}: the repo root is the service"
-    assert scanned > 50, f"only {scanned} workflow lines were scanned"
+    assert scanned == expected > 0, (scanned, expected)

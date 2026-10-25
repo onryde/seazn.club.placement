@@ -8,7 +8,7 @@ Every case builds a throwaway git repository holding ``buf.yaml``, a copy of
 ``scripts/buf-breaking.sh`` and a minimal proto, then runs the script exactly as
 CI does, with ``cwd`` set to that repository.
 
-Two rules shape the file (docs/superpowers/TEST-STRATEGY.md):
+Two rules shape the file (seazn.club's TEST-STRATEGY.md, see AGENTS.md, "Paths in comments"):
 
 * A skipped contract gate is a vacuous one, so nothing here skips. A missing
   ``buf`` is a FAILURE (``test_buf_is_installed``).
@@ -23,6 +23,8 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "buf-breaking.sh"
@@ -41,6 +43,18 @@ def _proto(*fields):
     """A minimal proto3 file whose one message carries the given field lines."""
     body = "".join(f"  {field}\n" for field in fields)
     return f'syntax = "proto3";\npackage demo.v1;\n\nmessage M {{\n{body}}}\n'
+
+
+def _rich_proto(field="string a = 1;", rpcs=("Ping", "Pong"), enum_values=("OFF = 0;", "ON = 1;")):
+    """A proto with a message, an enum and a service, each independently editable."""
+    rpc_lines = "".join(f"  rpc {name} (M) returns (M);\n" for name in rpcs)
+    enum_lines = "".join(f"  {value}\n" for value in enum_values)
+    return (
+        'syntax = "proto3";\npackage demo.v1;\n\n'
+        f"message M {{\n  {field}\n}}\n\n"
+        f"enum Mode {{\n{enum_lines}}}\n\n"
+        f"service S {{\n{rpc_lines}}}\n"
+    )
 
 
 def _git_env():
@@ -97,6 +111,14 @@ def _run(repo, base, *, env=None):
     )
 
 
+def _run_with_private_tmpdir(repo, base, tmp_path):
+    """Run with TMPDIR pointing at a fresh empty dir. Returns (result, what is left in it)."""
+    scratch = tmp_path / "scratch-tmp"
+    scratch.mkdir()
+    result = _run(repo, base, env={**os.environ, "TMPDIR": str(scratch)})
+    return result, sorted(p.name for p in scratch.iterdir())
+
+
 def _output(result):
     return result.stdout + result.stderr
 
@@ -151,11 +173,25 @@ def test_installed_buf_is_the_pinned_version():
     assert result.stdout.strip() == _pinned_buf_version()
 
 
-def test_buf_yaml_is_a_v2_file_rule_set_over_the_proto_dir():
-    text = BUF_YAML.read_text()
-    assert re.search(r"^version: v2$", text, re.MULTILINE), text
-    assert re.search(r"^modules:\n  - path: proto$", text, re.MULTILINE), text
-    assert re.search(r"^breaking:\n  use:\n    - FILE$", text, re.MULTILINE), text
+EXPECTED_BUF_YAML = """\
+version: v2
+modules:
+  - path: proto
+breaking:
+  use:
+    - FILE
+"""
+
+
+def test_buf_yaml_is_exactly_the_file_rule_set_over_the_proto_dir():
+    # Equality, not a substring match: an `except:` or `ignore:` appended under
+    # `breaking:` leaves every line of the pin below it intact and still turns
+    # rules off. The behavioural cases further down are the second line of defence.
+    code = "".join(
+        line for line in BUF_YAML.read_text().splitlines(keepends=True)
+        if not line.lstrip().startswith("#")
+    )
+    assert code == EXPECTED_BUF_YAML, code
 
 
 def test_fails_when_buf_is_not_on_path(tmp_path):
@@ -217,6 +253,34 @@ def test_skips_when_base_has_no_proto(tmp_path):
     assert "skipped" in result.stdout
 
 
+def test_skips_when_the_base_proto_dir_holds_no_proto_file(tmp_path):
+    # A proto/ directory with only a README is still "no earlier proto".
+    repo = _new_repo(tmp_path)
+    base = _commit(repo, {"proto/README.md": "# x\n"}, "base: proto dir, no .proto")
+    _commit(repo, {**_tooling(), "proto/scheduler.proto": _proto("string a = 1;")}, "import")
+    result = _run(repo, base)
+    assert result.returncode == 0, _output(result)
+    assert "first import" in result.stdout and "skipped" in result.stdout
+
+
+def test_a_base_proto_with_another_name_is_still_compared(tmp_path):
+    # The skip must not key on the one file name. If it did, a commit that
+    # RENAMED the contract file would be waved through as a "first import".
+    repo = _new_repo(tmp_path)
+    base = _commit(repo, {"proto/legacy.proto": _proto("string a = 1;")}, "base: legacy.proto")
+    _commit(
+        repo,
+        {**_tooling(), "proto/scheduler.proto": _proto("string a = 1;")},
+        "head: legacy.proto renamed",
+        remove=["proto/legacy.proto"],
+    )
+    result = _run(repo, base)
+    out = _output(result)
+    assert result.returncode == BUF_FINDINGS_EXIT, out
+    assert "skipped" not in out and "::error::" not in out, out
+    assert 'file "proto/legacy.proto" was deleted' in out or "legacy.proto" in out, out
+
+
 def test_fails_on_unresolvable_base(tmp_path):
     # Review Focus 1: a base that is not in this clone is a broken checkout,
     # never a first import.
@@ -260,6 +324,25 @@ def test_fails_when_the_base_tree_cannot_be_read(tmp_path):
     assert result.returncode == 1, out
     assert "::error::" in out, out
     assert "skipped" not in out, out
+
+
+def test_fails_loudly_when_the_base_proto_blob_is_missing(tmp_path):
+    # The base's tree reads fine but its proto blob is gone, so `git archive`
+    # fails mid-pipeline. That must be an explicit ::error::, not a bare
+    # exit 128/255, and the temp dir the script made must not be left behind.
+    repo = _new_repo(tmp_path)
+    base = _commit(repo, {**_tooling(), "proto/scheduler.proto": _proto("string a = 1;")}, "base")
+    _commit(repo, {"proto/scheduler.proto": _proto("string a = 1;", "string b = 2;")}, "head")
+    blob = _git(repo, "rev-parse", f"{base}:proto/scheduler.proto")
+    blob_file = repo / ".git" / "objects" / blob[:2] / blob[2:]
+    assert blob_file.is_file()
+    blob_file.unlink()
+    result, left_behind = _run_with_private_tmpdir(repo, base, tmp_path)
+    out = _output(result)
+    assert result.returncode == 1, out
+    assert "::error::" in out and "fetch-depth: 0" in out, out
+    assert "skipped" not in out, out
+    assert left_behind == [], f"the script left {left_behind} in TMPDIR"
 
 
 # --- the comparison ---------------------------------------------------------
@@ -324,6 +407,49 @@ def test_fails_on_a_removed_message(tmp_path):
     assert 'message "N" was deleted' in out, out
 
 
+@pytest.mark.parametrize(
+    ("head", "finding"),
+    [
+        pytest.param(
+            _rich_proto(rpcs=("Ping",)),
+            'Previously present RPC "Pong" on service "S" was deleted',
+            id="rpc-removed",
+        ),
+        pytest.param(
+            _rich_proto(field="int32 a = 1;"),
+            'changed type from "string" to "int32"',
+            id="field-type-changed",
+        ),
+        pytest.param(
+            _rich_proto(enum_values=("OFF = 0;",)),
+            'Previously present enum value "1" on enum "Mode" was deleted',
+            id="enum-value-removed",
+        ),
+        pytest.param(
+            _rich_proto(field="repeated string a = 1;"),
+            'changed cardinality from "optional with implicit presence" to "repeated"',
+            id="field-made-repeated",
+        ),
+    ],
+)
+def test_fails_on_other_breaking_changes(tmp_path, head, finding):
+    # Each of these is a rule an `except:` in buf.yaml could switch off while
+    # the exact-text pin above is the only thing that notices. Each must reach
+    # buf's own findings (exit 100) with the right reason.
+    assert head != _rich_proto()
+    result = _compare(tmp_path, _rich_proto(), head)
+    out = _output(result)
+    assert result.returncode == BUF_FINDINGS_EXIT, out
+    assert "::error::" not in out, out
+    assert finding in out, out
+
+
+def test_a_rich_proto_against_itself_passes(tmp_path):
+    # The negative half of the cases above: the same base and an equal head are clean.
+    result = _compare(tmp_path, _rich_proto(), _rich_proto() + "\n// no contract change\n")
+    _assert_buf_compared_and_passed(result)
+
+
 def test_a_base_without_buf_yaml_is_still_compared(tmp_path):
     # The push that introduces buf has a base from BEFORE buf.yaml existed. If
     # the base tree were handed to buf as it stands, its module root would be
@@ -346,20 +472,26 @@ def test_a_base_without_buf_yaml_is_still_compared(tmp_path):
     _assert_buf_found_a_break(_run(repo, base), field="1")
 
 
-def test_the_script_leaves_the_working_tree_clean(tmp_path):
-    # It extracts the base into a temp dir. Nothing may land in the checkout:
-    # CI's later steps must see exactly the tree that was tested.
+def test_the_script_leaves_nothing_behind(tmp_path):
+    # It extracts the base into a temp dir. Nothing may land in the checkout
+    # (CI's later steps must see exactly the tree that was tested) and the temp
+    # dir itself must be removed.
     repo = _new_repo(tmp_path)
     base = _commit(repo, {**_tooling(), "proto/scheduler.proto": _proto("string a = 1;")}, "base")
     _commit(repo, {"proto/scheduler.proto": _proto("string a = 1;", "string b = 2;")}, "head")
-    _assert_buf_compared_and_passed(_run(repo, base))
+    result, left_behind = _run_with_private_tmpdir(repo, base, tmp_path)
+    _assert_buf_compared_and_passed(result)
     assert _git(repo, "status", "--porcelain") == ""
+    # ...and none of it is left in TMPDIR either (the EXIT trap ran).
+    assert left_behind == [], f"the script left {left_behind} in TMPDIR"
 
 
 def test_real_proto_against_itself_passes(tmp_path):
     # Anti-vacuity on the real contract: the repo's own proto, as base and head.
     real = REAL_PROTO.read_text()
-    assert len(real) > 10_000, "proto/scheduler.proto is unexpectedly small"
+    # Prove the file is a real contract (messages and a service), not an empty stand-in.
+    assert re.findall(r"^message \w+", real, re.MULTILINE), "no messages in proto/scheduler.proto"
+    assert re.findall(r"^\s+rpc \w+", real, re.MULTILINE), "no rpc in proto/scheduler.proto"
     result = _compare(tmp_path, real, real + "\n// a trailing comment changes no contract\n")
     _assert_buf_compared_and_passed(result)
 

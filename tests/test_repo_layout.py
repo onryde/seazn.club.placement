@@ -3,8 +3,9 @@ written for the service's old home inside seazn.club. These pins keep the
 move honest.
 
 Every sweep reports what it scanned and zero scanned is a FAILURE
-(docs/superpowers/TEST-STRATEGY.md, anti-vacuity). The old-layout needles are
-assembled from pieces so this file does not match its own sweep.
+(seazn.club's TEST-STRATEGY.md, see AGENTS.md, "Paths in comments": anti-vacuity).
+The old-layout needles are assembled from pieces so this file does not match its
+own sweep.
 """
 
 import re
@@ -72,11 +73,15 @@ def test_docs_name_the_python_the_ci_runs():
     assert len(ci_versions) == 1, ci_versions
     (ci_version,) = ci_versions
     checked = 0
+    expected = 0
     for rel in ("README.md", "AGENTS.md"):
-        for found in re.findall(r"uv venv --python (\S+)", (REPO_ROOT / rel).read_text()):
+        text = (REPO_ROOT / rel).read_text()
+        expected += text.count("uv venv --python")
+        for found in re.findall(r"uv venv --python (\S+)", text):
             checked += 1
             assert found == ci_version, f"{rel}: 'uv venv --python {found}' but CI runs {ci_version}"
-    assert checked >= 2, f"only {checked} 'uv venv --python' lines were checked"
+    # Every mention was parsed (none slipped past the pattern), and there is at least one.
+    assert checked == expected > 0, (checked, expected)
 
 
 def test_docs_never_prefix_path_with_a_bare_buf_dir():
@@ -98,7 +103,8 @@ def test_docs_never_prefix_path_with_a_bare_buf_dir():
 def test_readme_marks_the_commands_that_run_in_a_seazn_club_checkout():
     lines = (REPO_ROOT / "README.md").read_text().splitlines()
     cds = [i for i, line in enumerate(lines) if line.startswith("cd packages/")]
-    assert len(cds) >= 2, f"expected the README's two 'cd packages/...' commands, found {len(cds)}"
+    mentions = sum(line.count("cd packages/") for line in lines)
+    assert len(cds) == mentions > 0, f"{len(cds)} command lines but {mentions} mentions of 'cd packages/'"
     for i in cds:
         assert lines[i - 1] == "# in a seazn.club checkout", (
             f"README.md:{i + 1}: '{lines[i]}' names a seazn.club path; say where it runs"

@@ -1,27 +1,34 @@
 name: ci
 
-# The whole repository is the placement service, so there is no path filter: a
-# pull request and every push to main run all four jobs below.
+# The whole repository is the placement service, so there is no path filter.
+# Every pull request and every push to main runs test, docker and buf-breaking;
+# only a push to main goes on to publish.
 #
 #   test          pytest on Python 3.14 (includes tests/test_buf_breaking.py,
-#                 which needs buf, and tests/test_ci_wiring.py, which pins this
-#                 file)
-#   docker        builds the image and starts it; nothing is pushed
+#                 which needs buf, and the pins on this file)
+#   docker        builds the image once, starts it and smoke-tests it; on main
+#                 it also keeps that exact image as a build artifact
 #   buf-breaking  proto/scheduler.proto is additive-only (AGENTS.md)
-#   publish       main only, after the three above: pushes the one public image
-#                 ghcr.io/onryde/seazn-placement:<commit sha>
+#   publish       main only, after the three above: pushes THAT image, never a
+#                 rebuild, as ghcr.io/onryde/seazn-placement:<commit sha>
 #
-# Deploys live in their own workflows (stg.yml on push to main, prod.yml on a
-# v*.*.* tag). This file never deploys.
+# This file never deploys; deploy workflows are separate files.
+#
+# Every action is pinned to a full commit sha with its major version in a
+# trailing comment, and tests/test_ci_wiring.py holds the allowlist. To move one,
+# resolve the new tag to a commit (gh api repos/<owner>/<repo>/git/ref/tags/<tag>,
+# dereferencing an annotated tag) and change the sha and the comment together.
 on:
   pull_request:
   push:
     branches: [main]
 
-# Cancelling a PR run when a newer push arrives is right. Cancelling a run on
-# main would abandon a publish half way, so only pull requests cancel.
+# Cancelling a PR run when a newer push arrives is right. A push to main is
+# keyed on its own sha instead of the branch: otherwise a newer push would cancel
+# a pending run, and the commit in the middle would never get its image. Nothing
+# on main is ever cancelled, so a publish is never abandoned half way.
 concurrency:
-  group: placement-ci-${{ github.ref }}
+  group: placement-ci-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Least privilege for GITHUB_TOKEN (CodeQL actions/missing-workflow-permissions).
@@ -37,10 +44,14 @@ env:
   # Bump it to the newest buf release that is at least two weeks old:
   #   gh release list -R bufbuild/buf --limit 5
   BUF_VERSION: "1.73.0"
+  # sha256 of that release's buf-Linux-x86_64 (its sha256.txt). buf-action
+  # verifies the binary it installs against it, so a swapped release asset fails
+  # the job instead of running. Change it together with BUF_VERSION.
+  BUF_SHA256_LINUX_X86_64: "8f2986298ad08f0cc1bf999b9797b7c383adf32d7edf0f73d6f1e1a701baeac1"
 
 jobs:
   # ---------------------------------------------------------------------
-  # Python 3.14, NOT the design doc's original 3.11. The service is built
+  # Python 3.14, NOT 3.11 (the floor in pyproject.toml). The service is built
   # and tested on CPython 3.14.6, and every dependency wheel installed
   # against it is native cp314 (ortools, grpcio, grpcio-tools all publish
   # manylinux cp314 wheels for x86_64). pyproject.toml's
@@ -53,19 +64,23 @@ jobs:
   test:
     name: Test (pytest, Python 3.14)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.14"
 
       # tests/test_buf_breaking.py drives the real buf and FAILS (never skips)
       # when it is missing: a skipped contract gate is a vacuous one.
       - name: Install buf
-        uses: bufbuild/buf-action@v1
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1
         with:
           setup_only: true
           version: ${{ env.BUF_VERSION }}
+          checksum: ${{ env.BUF_SHA256_LINUX_X86_64 }}
 
       - name: Install (editable, dev extras)
         run: pip install -e ".[dev]"
@@ -136,34 +151,49 @@ jobs:
         run: python -m pytest tests/test_model.py::test_production_board_meets_the_stated_acceptance_criterion -v
 
   # ---------------------------------------------------------------------
-  # This job is the ONLY gate on the Dockerfile before the publish job pushes
-  # it - the developer machine has no container runtime at all (no docker, no
-  # usable podman/colima), so nobody can build or run this image locally. If
-  # this job is wrong, nothing else catches a broken Dockerfile before
-  # `fly deploy` does.
+  # This job is the ONLY gate on the Dockerfile before the image is pushed - the
+  # developer machine has no container runtime at all (no docker, no usable
+  # podman/colima), so nobody can build or run this image locally. If this job is
+  # wrong, nothing else catches a broken Dockerfile before `fly deploy` does.
+  #
+  # The image is built ONCE, here. The tar the build exports is what the smoke
+  # steps run (after `docker load`) and, on main, what the publish job pushes:
+  # the pushed bytes are the tested bytes. A second build in publish would
+  # resolve the floating inputs again (dependency ranges, the base image tag) and
+  # could ship something nobody tested.
   # ---------------------------------------------------------------------
   docker:
     name: Docker build + image smoke test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      # Build only. No login, no push, no deploy. `load: true` puts the
-      # built image in the local daemon so the steps below can `docker
-      # run` it; `push: false` is stated explicitly (it is also the
-      # action's default) because a silently-added push/login step in THIS
-      # job would be a supply-chain surprise, not a convenience. Pushing
-      # belongs to the publish job, which alone holds `packages: write`.
+      # Build only. No login, no push, no deploy. `outputs: type=docker` writes
+      # the image to a tar (it cannot be combined with `load: true`); the next
+      # step loads that same tar. `push: false` is stated explicitly (it is also
+      # the action's default) because a silently-added push/login step in THIS
+      # job would be a supply-chain surprise, not a convenience. Pushing belongs
+      # to the publish job, which alone holds `packages: write`.
+      #
+      # `labels:` links the package to this repo, which is what lets the
+      # package inherit the repo's visibility and be managed from it.
       - name: Build the placement service image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile
           push: false
-          load: true
+          outputs: type=docker,dest=${{ runner.temp }}/placement-image.tar
           tags: placement-service:ci
+          labels: org.opencontainers.image.source=https://github.com/onryde/seazn.club.placement
+
+      - name: Load the built image
+        run: docker load --input "$RUNNER_TEMP/placement-image.tar"
 
       - name: Report image size
         run: docker images placement-service:ci --format '{{.Size}}'
@@ -230,6 +260,17 @@ jobs:
           fi
           echo "container is running and the port accepted a TCP connection"
 
+      # The image that just passed every step above, kept for the publish job.
+      # One day of retention is enough: publish runs in this same workflow run.
+      - name: Keep the tested image for the publish job
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: placement-image
+          path: ${{ runner.temp }}/placement-image.tar
+          retention-days: 1
+          if-no-files-found: error
+
   # ---------------------------------------------------------------------
   # proto/scheduler.proto is additive-only: seazn.club vendors a copy of it
   # and deploys on its own clock, so a removed or renumbered field is a wire
@@ -244,24 +285,29 @@ jobs:
   #   pull_request  the tip of the target branch, origin/<base_ref>
   #   push to main  github.event.before, the previous tip. This is also how
   #                 the first import's skip shows up in a log: no PR exists
-  #                 for the import push. (A force-push that drops `before`
-  #                 from the clone fails here, loudly; re-run after fixing it.)
+  #                 for the import push.
+  # A force-push that leaves `before` unreachable fails here, and a re-run of
+  # that workflow fails the same way: it reuses the same `before`. Force-pushes
+  # to main should be blocked by branch protection, not retried.
   # The base reaches the script through `env:`, never interpolated into the
   # shell text.
   # ---------------------------------------------------------------------
   buf-breaking:
     name: buf breaking (proto is additive-only)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install buf
-        uses: bufbuild/buf-action@v1
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1
         with:
           setup_only: true
           version: ${{ env.BUF_VERSION }}
+          checksum: ${{ env.BUF_SHA256_LINUX_X86_64 }}
 
       - name: buf breaking (pull request, against the target branch)
         if: github.event_name == 'pull_request'
@@ -281,9 +327,13 @@ jobs:
   # seazn.club pull it anonymously. The tag is the immutable commit sha, never
   # `latest` or `main`.
   #
+  # It pushes the image the docker job tested (downloaded as a tar, loaded and
+  # tagged); it does not build. scripts/publish-image.sh asks the registry first
+  # and leaves an existing sha tag alone, so a re-run cannot move a published tag.
+  #
   # Runs on a push to main only, after every gate. tests/test_ci_wiring.py pins
-  # the `if:`, the `needs:`, the tag, the label and that this is the only place
-  # `packages: write` appears.
+  # the `if:`, the `needs:`, the tag, that this is the only place
+  # `packages: write` appears, and that this job builds nothing.
   #
   # The package's visibility (public) is set once by the repo owner in the
   # GitHub UI; there is no REST endpoint for it, so nothing here can do it.
@@ -294,41 +344,33 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test, docker, buf-breaking]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write
+    env:
+      IMAGE: ghcr.io/onryde/seazn-placement:${{ github.sha }}
     steps:
-      - uses: actions/checkout@v5
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # Only for scripts/publish-image.sh; nothing is built from this checkout.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Download the tested image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: placement-image
+          path: ${{ runner.temp }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `labels:` links the package to this repo, which is what lets the
-      # package inherit the repo's visibility and be managed from it.
-      - name: Build and push the image
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          push: true
-          tags: ghcr.io/onryde/seazn-placement:${{ github.sha }}
-          labels: org.opencontainers.image.source=https://github.com/onryde/seazn.club.placement
-
-      # An empty digest means the push did not happen as reported; fail
-      # instead of printing an empty line.
-      - name: Report the pushed digest
+      - name: Push the tested image (unless this sha is already published)
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          if ! test -n "$DIGEST"; then
-            echo "::error::build-push-action reported no digest, so the push cannot be confirmed"
-            exit 1
-          fi
-          echo "pushed the image for $GITHUB_SHA, digest $DIGEST"
+          TAR: ${{ runner.temp }}/placement-image.tar
+          TESTED: placement-service:ci
+        run: bash scripts/publish-image.sh "$TAR" "$TESTED" "$IMAGE"
