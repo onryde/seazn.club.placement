@@ -51,7 +51,9 @@ The order for a contract change is:
 
 ```bash
 uv venv --python 3.14 venv && uv pip install --python venv/bin/python -e ".[dev]"
-PATH="$BUF_DIR:$PATH" venv/bin/python -m pytest tests/ -q \
+# BUF_DIR holds the pinned buf; README.md, "Installing buf", sets it up.
+# The ${BUF_DIR:+...} form adds nothing to PATH when BUF_DIR is unset.
+PATH="${BUF_DIR:+$BUF_DIR:}$PATH" venv/bin/python -m pytest tests/ -q \
   --deselect tests/test_model.py::test_production_board_meets_the_stated_acceptance_criterion
 ```
 
@@ -60,7 +62,7 @@ PATH="$BUF_DIR:$PATH" venv/bin/python -m pytest tests/ -q \
   (non-blocking) step.
 - The generated stubs under `src/placement/generated/` are tracked.
   `tests/test_proto_compiles.py` byte-compares a fresh compile against them.
-- Local tests need the pinned `buf` on `PATH` (`BUF_DIR` above): the `buf breaking`
-  tests are added with the CI workflow.
+- Local tests need the pinned `buf` on `PATH` (`BUF_DIR` above, defined by
+  `README.md`, "Installing buf"): `tests/test_buf_breaking.py` fails, never skips, without it.
 - There is no container runtime on the developer machine, so the image is built
   and run only in CI.

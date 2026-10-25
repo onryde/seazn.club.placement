@@ -4,3 +4,4 @@ venv/
 .venv/
 .pytest_cache/
 *.pyc
+.env*

@@ -20,8 +20,8 @@ Start the service:
 # will NOT work here: this repo's system Python is 3.9.6 and this package
 # declares `requires-python = ">=3.11"` (pyproject.toml) — use `uv` to get a
 # venv on a Python new enough, downloading one if it has to:
-uv venv --python 3.11 venv
-venv/bin/pip install -e ".[dev]"
+uv venv --python 3.14 venv   # CI and the image run 3.14
+uv pip install --python venv/bin/python -e ".[dev]"   # uv venvs ship no pip
 PLACEMENT_SERVICE_SECRET=dev-secret PLACEMENT_PORT=50051 venv/bin/python3 -m placement.main
 ```
 
@@ -29,13 +29,14 @@ It logs `placement service listening on :50051 (max_workers=4)` and then blocks
 in the foreground — leave that terminal open, or background it yourself
 (`... &`, noting the PID) if you need the terminal back.
 
-In another terminal, run the TS integration suite against it. The suite lives
-in `packages/scheduler` (the gRPC client moved there out of the engine, engine
+In another terminal, **in a seazn.club checkout** (not this repo), run the TS
+integration suite against it. The suite lives in `packages/scheduler` (the gRPC client moved there out of the engine, engine
 split 1a), which holds TWO live test files, and there is no `test:integration`
 script in `packages/scheduler/package.json` — this is the direct `vitest`
 invocation, naming both:
 
 ```bash
+# in a seazn.club checkout
 cd packages/scheduler
 PLACEMENT_SERVICE_HOST=localhost:50051 PLACEMENT_SERVICE_SECRET=dev-secret \
   npx vitest run src/__tests__/placement-integration.test.ts \
@@ -47,6 +48,7 @@ the production default (`placement.flycast:50051`, unreachable from a dev
 machine) — that is the correct, expected behaviour, not a failure:
 
 ```bash
+# in a seazn.club checkout
 cd packages/scheduler
 npx vitest run src/__tests__/placement-integration.test.ts \
                src/__tests__/repair-decompose-cpsat-integration.test.ts
