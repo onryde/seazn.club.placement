@@ -22,7 +22,9 @@
 #   anything else           5xx, 429, a timeout, TLS, EOF, DNS: the answer is
 #                           unknown. It is retried a bounded number of times and
 #                           then the script fails with the captured error. It
-#                           never pushes on an answer it did not get.
+#                           never pushes on an answer it did not get. A failure
+#                           that says both ("503 ..." with "not found" in its
+#                           body) is unknown too: the status wins.
 #
 # Exit codes: 0 pushed, or already published; 1 the registry could not be asked or
 # a digest could not be read; 2 usage; anything else is the failing docker
@@ -44,10 +46,19 @@ digest_in() {
 }
 
 # The registry's answer to `imagetools inspect <image>` when it failed, read from
-# the output ($1). Prints "absent" or "unknown". Word-bounded on the status codes
-# so the digits of a commit sha in the image name cannot make a 503 read as 404.
+# the output ($1). Prints "absent" or "unknown".
+#
+# A signal that the registry could not ANSWER wins over any word that looks like
+# "absent": a 502 page whose body says "404 Not Found", or a 429 whose request id
+# reads 4F2A:403:9C1, says nothing about the tag. Both patterns are word-bounded
+# on the status codes so the digits of a commit sha in the image name cannot make
+# a 503 read as 404 (or the reverse).
 classify() {
-  if grep -Eiq 'not found|manifest_unknown|name_unknown|denied|unauthorized|(^|[^[:alnum:]])(401|403|404)([^[:alnum:]]|$)' <<<"$1"; then
+  local could_not_answer='(^|[^[:alnum:]])(429|5[0-9][0-9]|eof)([^[:alnum:]]|$)|timeout|timed out|unavailable|gateway|reset|refused|no such host|name resolution'
+  local says_absent='not found|manifest_unknown|name_unknown|denied|unauthorized|(^|[^[:alnum:]])(401|403|404)([^[:alnum:]]|$)'
+  if grep -Eiq "$could_not_answer" <<<"$1"; then
+    echo unknown
+  elif grep -Eiq "$says_absent" <<<"$1"; then
     echo absent
   else
     echo unknown

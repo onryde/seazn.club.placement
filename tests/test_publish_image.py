@@ -201,10 +201,15 @@ ABSENT_ERRORS = [
     "ERROR: unexpected status from HEAD request: 403 Forbidden",
     "ERROR: denied: requested access to the resource is denied",
     "ERROR: unexpected status from HEAD request: 401 Unauthorized",
+    "ERROR: unauthorized: authentication required",
     # A bare status code with none of the words above: the numbers count alone.
     "ERROR: server returned status code 404",
     "ERROR: server returned status code 403",
     "ERROR: server returned status code 401",
+    # What GHCR's token endpoint answers for a package that does not exist yet:
+    # the first publish must still go through.
+    "ERROR: failed to authorize: failed to fetch anonymous token: unexpected status from GET request to "
+    "https://ghcr.io/token?scope=repository%3Aonryde%2Fseazn-placement%3Apull&service=ghcr.io: 403 Forbidden",
 ]
 # Anything else says nothing about whether the tag exists.
 UNKNOWN_ERRORS = [
@@ -215,7 +220,41 @@ UNKNOWN_ERRORS = [
     "ERROR: Head https://ghcr.io/v2/x: dial tcp: i/o timeout",
     "ERROR: Head https://ghcr.io/v2/x: EOF",
     "ERROR: Head https://ghcr.io/v2/x: dial tcp: lookup ghcr.io: Temporary failure in name resolution",
+    # Nothing here is a word the script knows. Unrecognised means unknown (fail
+    # closed), never absent.
+    "ERROR: Head https://ghcr.io/v2/x: tls: failed to verify certificate: x509: certificate signed by unknown authority",
+    "ERROR: the registry client failed in a way nobody has seen before",
 ]
+# The status line says the registry could not answer; the BODY merely contains a
+# word that looks like "absent". The status wins: these are unknown, never a push.
+MISLEADING_ERRORS = [
+    'ERROR: unexpected status from HEAD request: 503 Service Unavailable: {"errors":[{"message":"upstream not found"}]}',
+    "ERROR: unexpected status from HEAD request: 502 Bad Gateway: <html><h1>404 Not Found</h1></html>",
+    "ERROR: unexpected status from HEAD request: 504 Gateway Timeout: access denied by upstream",
+    "ERROR: unexpected status from HEAD request: 429 Too Many Requests (request id 4F2A:403:9C1)",
+    "ERROR: upstream returned 404 while the registry answered 503 Service Unavailable",
+    "ERROR: 503 Service Unavailable: UNAUTHORIZED_TOKEN_SERVICE_RESTARTING",
+]
+# One transient signal per entry, each the ONLY such signal in its text, followed
+# by an absent-looking word. Deleting any one signal from the script's list must
+# turn exactly its case into a push.
+TRANSIENT_SIGNALS = [
+    "status code 429",
+    "status code 500",
+    "status code 502",
+    "status code 503",
+    "status code 504",
+    "dial tcp: i/o timeout",
+    "the request timed out",
+    "Head https://ghcr.io/v2/x: EOF",
+    "the backend is unavailable",
+    "an upstream gateway failure",
+    "connection reset by peer",
+    "connection refused",
+    "dial tcp: lookup ghcr.io: no such host",
+    "lookup ghcr.io: Temporary failure in name resolution",
+]
+TRANSIENT_WITH_ABSENT_WORD = [f"ERROR: {signal} (manifest not found, access denied)" for signal in TRANSIENT_SIGNALS]
 
 
 def _inspects(calls):
@@ -226,7 +265,7 @@ def _wrote_nothing(calls):
     return not any(call.startswith(("docker load ", "docker tag ", "docker push ")) for call in calls)
 
 
-@pytest.mark.parametrize("error", UNKNOWN_ERRORS)
+@pytest.mark.parametrize("error", UNKNOWN_ERRORS + MISLEADING_ERRORS + TRANSIENT_WITH_ABSENT_WORD)
 def test_an_inspect_error_that_is_not_absent_never_pushes(tmp_path, error):
     # The tag EXISTS here; the registry just cannot say so. Reading the failure as
     # "absent" would load, tag and push over a published sha tag and exit 0.
@@ -234,11 +273,26 @@ def test_an_inspect_error_that_is_not_absent_never_pushes(tmp_path, error):
     out = _output(result)
     assert _wrote_nothing(calls), calls
     assert result.returncode == 1, out
-    assert "::error::" in out, out
-    # The captured stderr is shown, not discarded.
-    assert error.removeprefix("ERROR: ") in out, out
     # Bounded: it tried again, and it gave up.
-    assert 2 <= len(_inspects(calls)) <= 5, calls
+    attempts = len(_inspects(calls))
+    assert 2 <= attempts <= 5, calls
+    # The one ::error:: names the image and the attempt it gave up on, and carries
+    # the registry's own text (the retry warnings carry it too, so look at THIS line).
+    errors = [line for line in out.splitlines() if line.startswith("::error::")]
+    assert len(errors) == 1, out
+    assert IMAGE in errors[0], errors[0]
+    assert f"attempt {attempts} of {attempts}" in errors[0], errors[0]
+    assert error.removeprefix("ERROR: ") in errors[0], errors[0]
+
+
+def test_a_multi_line_error_stays_on_one_annotation_line(tmp_path):
+    # A workflow command ends at the newline; the rest would print as plain text.
+    result, calls = _standard(
+        tmp_path, existing="1", inspect_err="ERROR: 503 Service Unavailable\nupstream request id 77aa"
+    )
+    errors = [line for line in _output(result).splitlines() if line.startswith("::error::")]
+    assert _wrote_nothing(calls) and result.returncode == 1, _output(result)
+    assert len(errors) == 1 and "503 Service Unavailable" in errors[0] and "upstream request id 77aa" in errors[0], errors
 
 
 @pytest.mark.parametrize("error", ABSENT_ERRORS)
@@ -277,8 +331,9 @@ def test_a_transient_error_then_not_found_publishes(tmp_path):
     assert [call.split()[1] for call in calls] == ["buildx", "buildx", "load", "tag", "push", "buildx"], calls
 
 
-def test_the_classifier_sees_the_error_not_the_image_name(tmp_path):
-    # A sha containing "404" must not turn a 503 into "not found".
+def test_a_sha_made_of_status_digits_does_not_turn_an_unrecognised_error_into_not_found(tmp_path):
+    # The error names the image, and a commit sha may contain 404. Only a status
+    # code standing alone counts, or this unrecognised failure would read as absent.
     image = "ghcr.io/onryde/seazn-placement:" + "0404" * 10
     result, calls = _run(
         tmp_path,
@@ -286,10 +341,29 @@ def test_the_classifier_sees_the_error_not_the_image_name(tmp_path):
         TESTED,
         image,
         existing="1",
-        inspect_err=f"ERROR: {image}: 503 Service Unavailable",
+        inspect_err=f"ERROR: {image}: the registry client failed in a way nobody has seen before",
     )
     assert _wrote_nothing(calls), calls
     assert result.returncode == 1, _output(result)
+
+
+def test_a_sha_made_of_status_digits_does_not_turn_not_found_into_unknown(tmp_path):
+    # The other direction: 500 and 429 inside the sha are not a 5xx or a 429, so a
+    # real "not found" for that image still publishes.
+    for digits in ("0500", "4290", "0503"):
+        image = "ghcr.io/onryde/seazn-placement:" + digits * 10
+        tmp = tmp_path / digits
+        tmp.mkdir()
+        result, calls = _run(
+            tmp,
+            str(tmp / "image.tar"),
+            TESTED,
+            image,
+            inspect_err=f"ERROR: {image}: not found",
+            inspect_err_times="1",
+        )
+        assert result.returncode == 0, (digits, _output(result))
+        assert f"docker push {image}" in calls, (digits, calls)
 
 
 def test_retries_back_off_and_the_wait_grows(tmp_path):
