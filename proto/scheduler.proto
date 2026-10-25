@@ -1,0 +1,356 @@
+syntax = "proto3";
+
+package seazn.placement.v1;
+
+// -- Build/Polish (tier solver) --------------------------------------------
+//
+// Round 6: identity in this bounded context is POSITIONAL, not string-based.
+// `_require_id`'s three-round canonicality saga (whitespace, then invisible
+// Unicode, then homoglyphs) never terminated because every character rule was
+// a guess about what a caller meant by two strings that render identically.
+// The service never actually misbehaved on any of them -- given two distinct
+// strings it saw two courts and placed one fixture on each, correctly. The
+// wrongness only appeared when a HUMAN rendered the board, and this context
+// never renders (see the DDD standard, section 1) -- so the fix is to stop
+// comparing strings at all. A fixture's identity is its index in `fixtures`;
+// a court's is its index in `court_names`; a division/entrant's identity is a
+// caller-assigned index bounded by a declared count. Two "confusable" court
+// NAMES are simply two distinct, correctly-disambiguated indices now -- there
+// is no canonicality question left to ask.
+//
+// The validation rule this replaces `_require_id` with, everywhere below:
+// every index must be IN RANGE for the list or count it points into, and
+// every singular (non-repeated) index field must be explicitly SET --
+// because 0 is always a legitimate index, an unset field cannot be told from
+// a deliberate `0` by value alone, and would otherwise silently resolve to
+// "index 0" rather than being refused. That is the same defence proto3
+// `optional` already gives `gap_minutes` and `Slot.day_index` below, applied
+// to every field whose whole job is naming one specific entity.
+
+message Fixture {
+  // Each element 0 <= idx < `SolveBuildRequest.entrant_count`. Repeated
+  // fields carry no presence ambiguity of their own -- every element that
+  // exists was explicitly appended by the caller -- so only the RANGE is
+  // checked, not presence.
+  repeated uint32 entrant_indices = 1;
+  // 0 <= idx < `SolveBuildRequest.division_count`. `optional` because
+  // division 0 is a real, legitimate division: without presence tracking, a
+  // caller who forgot to set this would silently join division 0's rest/cap
+  // rules instead of being refused -- the exact "unset vs. legitimately
+  // zero" trap this whole redesign exists to close, now on an index instead
+  // of a string.
+  optional uint32 division_index = 2;
+  // C1 (2026-08-12 round-ordering design) -- this fixture's 1-based position
+  // in ITS OWN round-robin sequence, not a global or cross-stage counter.
+  // `optional`: round 0 would otherwise be indistinguishable from "no round",
+  // and MOST fixtures carry none at all -- bracket/stepladder/swiss fixtures
+  // are already ordered by `dependencies` (winner/loser feed edges) and never
+  // get one; only round-robin-generated fixtures do. Absent means
+  // unconstrained by the round-order pair scan, not "round 0". The caller
+  // (`build.ts`) is responsible for never sending round-bearing fixtures from
+  // more than one round sequence in one division -- see
+  // `docs/superpowers/specs/2026-08-12-round-order-hard-lexicographic-design.md`.
+  optional uint32 round = 3;
+  // C10 (2026-08-16, wire person indices) -- mirrors `entrant_indices`
+  // exactly, one namespace over: 0 <= idx < `SolveBuildRequest.person_count`,
+  // range-checked only (repeated fields carry no presence ambiguity).
+  //
+  // A genuinely undecided knockout slot (a final, a third-place playoff,
+  // before its feeders have resolved) has no entrants yet but has PEOPLE --
+  // the players who can still reach it -- and two such slots can clash on a
+  // shared person while sharing no entrant at all. Before this field existed
+  // that clash was invisible to this service: a fixture with no entrants was
+  // refused outright (see `SolveBuildRequest`'s own history of that refusal),
+  // and even a fixture WITH entrants had no way to signal that its roster
+  // overlaps another fixture's under a DIFFERENT entrant id (the cross-
+  // division/multi-registration shape `packages/engine/src/scheduling/
+  // repair-domain.ts`'s `sharesParticipant` and `build-encode.ts`'s
+  // `byParticipant` already treat as a first-class case on the TS side).
+  //
+  // DELIBERATELY A SEPARATE NAMESPACE from `entrant_indices`, never merged
+  // into one index space: an entrant id and a person id can collide as
+  // plain integers (both start counting from 0) while meaning completely
+  // different things, and `repair-domain.ts`'s `sharesParticipant` already
+  // compares the two families in separate, non-crossing loops. This field
+  // mirrors that semantics rather than inventing a new one.
+  repeated uint32 person_indices = 4;
+  // #622 (round-scoped required court tags) -- the courts THIS fixture may be
+  // placed on, as indices into `SolveBuildRequest.court_names`. Range-checked
+  // only, like `entrant_indices`/`person_indices` above (a repeated field
+  // carries no presence ambiguity of its own).
+  //
+  // EMPTY MEANS UNCONSTRAINED, not "no court". That reading is not a
+  // convenience: it is the same one `candidateCourts`
+  // (packages/engine/src/scheduling/candidate-courts.ts, ruling 2) already
+  // gives an empty required-tag list, and it is what keeps this field free for
+  // every board that does not use it -- a request from a caller that never
+  // sets it is byte-identical to one sent before the field existed, so the
+  // homogeneous board (every fixture may use every court) pays nothing and
+  // `model.py` emits no extra constraint at all.
+  //
+  // WHY A PER-FIXTURE FIELD RATHER THAN A NARROWER `court_names`. Required
+  // court tags resolve at three scopes -- division, stage, and now round role
+  // -- and a division's fixtures span several stages while a stage's span
+  // several rounds. Narrowing the request-wide court list to the intersection
+  // would over-constrain every fixture by every other round's requirement (a
+  // court disqualified by the final's tags would disqualify the QFs too), and
+  // narrowing to the union would under-constrain all of them. Neither is the
+  // answer; the answer is per fixture, which is what this field carries.
+  //
+  // An index that names a court the fixture may use but the GRID offers no
+  // slot on is legal and inert -- `model.py` already keeps a fixture off a
+  // slotless court independently (section 1b).
+  repeated uint32 allowed_court_indices = 5;
+}
+
+message Slot {
+  // 0 <= idx < len(`SolveBuildRequest.court_names`). `optional` for the same
+  // reason as `Fixture.division_index`: court 0 is real, so an unset field
+  // must be refused rather than silently defaulting to it.
+  optional uint32 court_index = 1;
+  int64 start_at_ms = 2;
+  // Unchanged from the string-identity contract: NOT an index into anything
+  // declared elsewhere (there is no `day_count`), just the caller's own
+  // resolved calendar-day integer. Day 0 is a legitimate value, so `optional`
+  // + presence is what separates it from unset -- exactly as before.
+  optional int32 day_index = 3;
+}
+
+// A blocking interval with no identity of its own. It never carried one that
+// mattered: the old `Assignment.fixture_id` on an `existing` row reached
+// nothing but a debug label on the CP-SAT interval variable's name
+// (`model.py`'s `ivc_existing_{id}`), confirmed by tracing every read of it,
+// not merely by the docstring that first claimed it. `model.py:118-120`
+// already documented that a pinned row carries no entrant list; this is the
+// same fact one field further.
+message PinnedRow {
+  optional uint32 court_index = 1;
+  int64 start_at_ms = 2;
+  // C4 -- which rule groups this pin COUNTS AGAINST.
+  //
+  // A pinned row is a real match on a real day, and until this field existed
+  // the model could not attribute one to any rule, so a pin consumed none of
+  // its day's allowance and the solver was free to add a full cap's worth on
+  // top of it. Measured on a staging board: day cap 7, six pinned matches on
+  // one day, and the solver legitimately placed seven more -- thirteen
+  // matches on a day the organiser capped at seven.
+  //
+  // Indices into `SolveBuildRequest.rule_groups`, not a division: caps are
+  // NOT division-scoped by construction. `max_fixtures_per_day` accepts the
+  // full scope union in the engine (competition, division, entrant, person,
+  // pool) and only `build.ts` narrowed it to division, so a `division_index`
+  // here would have carved that accident into the contract.
+  //
+  // Repeated, because a single pin can sit inside a division cap and a
+  // competition cap at once, and must count against both.
+  //
+  // EMPTY IS A REAL ANSWER, not a missing one: a pin covered by no rule group
+  // counts against nothing. That is why this is `repeated` rather than an
+  // `optional` index -- repeated fields carry no presence ambiguity, every
+  // element that exists was explicitly appended, so only the RANGE is checked.
+  repeated uint32 rule_group_indices = 3;
+  // C6 -- who is playing in this pinned match. Each element
+  // 0 <= idx < `SolveBuildRequest.entrant_count`.
+  //
+  // Round 6 stripped `fixture_id` from this message and was right to: that
+  // field reached nothing but a debug label on a CP-SAT interval variable.
+  // This is not that field returning. It is the one fact about a pin the
+  // REST rules need and could not get, and it is an index into a list the
+  // request already carries -- no string is compared, and `court_names` stays
+  // display-only.
+  //
+  // What it closes: `by_entrant` is built from movable fixtures only, so two
+  // PINNED rows sharing an entrant thirty minutes apart under a 30-minute
+  // rest rule are invisible to each other. The service returns OPTIMAL on a
+  // board the TS verifier (`validateAssignments`) rejects.
+  repeated uint32 entrant_indices = 4;
+  // C1 (2026-08-12 round-ordering design) -- this pin's round, in the SAME
+  // sequence as `Fixture.round`, so a pin-movable pair can be ordered even
+  // though the pin never moves. `optional`, same reasoning as `Fixture.round`
+  // -- most pins carry none. No `division_index` accompanies it: this
+  // message deliberately carries none at all (see the message's own header
+  // comment), so the CALLER (`build.ts`) is the one place that can attribute
+  // a pin to a division, and it must only ever forward a pin's round when
+  // that division match against the movable round-robin sequence is
+  // unambiguous -- the model has no way to re-verify it.
+  optional uint32 round = 5;
+}
+
+// C1 -- a rule and the exact set of fixtures it binds.
+//
+// The obvious shape for scopes-above-the-division was to put the SCOPE on the
+// wire: a oneof over competition / division / entrant / person / pool. That
+// is the wrong shape, and rejecting it is the whole design.
+//
+// It would require teaching this service what a pool and a person ARE. The
+// service has no person concept at all -- `Fixture` carries entrant indices
+// and persons appear nowhere -- and `_RULES.md` section 1 is explicit that
+// this context does not own org/tenant concepts. Generalising the scope onto
+// the wire leaks the domain in precisely the direction the DDD standard
+// forbids.
+//
+// So the ACL resolves the scope and sends the RESULT. `build.ts` already owns
+// `scopeCoversFixture` and already resolves any scope to a set of fixtures;
+// it does that and sends the set. The service applies a rule to a set of
+// fixture positions, which is the only thing it was ever doing -- it never
+// learns what a division, pool, entrant or person is.
+//
+// This subsumed `DivisionRule`: a division was one such group. `division_rules`
+// (proto field 10) carried that division-only predecessor and has since been
+// retired -- reserved on `SolveBuildRequest`, not reused; see
+// `SolveBuildRequest.rule_groups` below.
+message RuleGroup {
+  // Each element 0 <= idx < len(`SolveBuildRequest.fixtures`). Range-checked
+  // only, per the repeated-field rule above.
+  //
+  // An EMPTY set is legal and means the rule binds no movable fixture. That
+  // is not a caller error: a competition-scoped rule on a board where every
+  // fixture is pinned resolves to exactly this, and the rule still has to
+  // reach the service because pins reference it via `rule_group_indices`.
+  repeated uint32 fixture_indices = 1;
+  // Presence, not `>= 0`: 0 is "no minimum rest", a legitimate rule, and
+  // distinct from this group carrying no rest rule at all.
+  optional int32 min_rest_minutes = 2;
+  // Presence, then `> 0` when set: 0 would forbid the group outright, which
+  // is never what "no cap" means. Absent = uncapped.
+  optional int32 max_fixtures_per_day = 3;
+}
+
+// (before, after) as FIXTURE indices -- 0 <= idx < len(`SolveBuildRequest.
+// fixtures`). Note what this closes for free: the old contract needed a
+// dedicated check rejecting a dependency that named a PINNED row's id
+// (`existing` and `fixtures` shared one string namespace, so `"x1"` was a
+// real id that happened to resolve to nothing). `PinnedRow` has no identity
+// at all now, so there is no namespace for a dependency to misname -- an
+// out-of-range index is the whole story.
+message OrderPair {
+  optional uint32 before_index = 1;
+  optional uint32 after_index = 2;
+}
+
+message BuildConstraints {
+  int32 match_minutes = 1;
+  // `optional` because 0 is real ("no court turnaround") and unset arrives
+  // as the same 0.
+  optional int32 gap_minutes = 2;
+}
+
+enum SolveStatus {
+  SOLVE_STATUS_UNSPECIFIED = 0;
+  SOLVE_STATUS_OPTIMAL = 1;
+  SOLVE_STATUS_FEASIBLE = 2;
+  SOLVE_STATUS_INFEASIBLE = 3;
+  SOLVE_STATUS_UNKNOWN = 4;
+  SOLVE_STATUS_ERROR = 5;
+}
+
+// One rung of the lexicographic objective chain and the value it PROVED.
+message Tier {
+  // `placed` | `days` | `day_span` | `day_start` | `idle_gap` | `imbalance`,
+  // in that order. Shared vocabulary with the TypeScript caller; see the DDD
+  // standard's ubiquitous-language rule. A tier name is a fixed protocol
+  // constant, not caller data.
+  //
+  // `makespan` was RETIRED here on 2026-08-13, not renamed. It meant
+  // whole-board span, which on a multi-day board is mostly measuring the
+  // overnight hours nobody can schedule into; the three day-aware rungs that
+  // replaced it mean something else. Reusing the name for `day_span` would
+  // have shipped a number whose meaning changed while its name did not, so a
+  // consumer still keying on `"makespan"` now gets an unknown name and fails
+  // loudly. That is deliberate. The count moved with it: `TIER_COUNT` /
+  // `TIERS_TOTAL` went 4 -> 6 on both sides, and it is the optimality
+  // predicate (`tiers_completed == tiers_total`), so the two move together or
+  // the predicate silently never fires.
+  string name = 1;
+  // NOT milliseconds for every tier -- see the field's history if this ever
+  // moves again. Untouched here.
+  int64 value = 2;
+}
+
+message SolveError {
+  string code = 1;
+  string message = 2;
+}
+
+// The OUTPUT half of what used to be `Assignment` (fixture_id, court,
+// start_at_ms). Positional now: a caller maps `fixture_index`/`court_index`
+// back through the SAME `fixtures`/`court_names` arrays it sent. Never
+// validated as input -- this message is service-authored only.
+message Assignment {
+  uint32 fixture_index = 1;
+  uint32 court_index = 2;
+  int64 start_at_ms = 3;
+}
+
+message SolveBuildRequest {
+  // Unchanged: an opaque correlation token, never compared, never joined
+  // against anything, reaching only a log line. Not identity in the sense
+  // this redesign is about, and untouched by it.
+  string request_id = 1;
+  // DISPLAY ONLY. Never compared, never required unique, never validated for
+  // content -- two entries that render identically are simply two distinct,
+  // correctly-disambiguated court indices; see the file header. Its LENGTH is
+  // the declared (not inferred) bound for every `court_index` field below,
+  // exactly as `fixtures`' own length bounds a fixture index.
+  repeated string court_names = 2;
+  // The declared bound for every `entrant_indices` value. Entrants have no
+  // names on the wire at all -- unlike courts, nothing about an entrant is
+  // ever rendered by this service, so there is nothing to carry for display.
+  // An inferred bound (the largest index actually used) cannot distinguish
+  // "entrant 7" from a typo; a declared count can.
+  uint32 entrant_count = 3;
+  // The declared bound for every `division_index` value, for the same reason
+  // `entrant_count` is declared rather than inferred.
+  uint32 division_count = 4;
+  repeated Fixture fixtures = 5;
+  repeated Slot slots = 6;
+  // Unread by the domain (`model.py` `del`etes its parameter immediately) --
+  // contractual only, exactly as before. Kept at the top level now that
+  // `Grid` no longer has a reason to exist: it existed only to pair `slots`
+  // with this field, and nothing else about it needs a wrapper message.
+  int32 step_minutes = 7;
+  repeated PinnedRow existing = 8;
+  repeated OrderPair dependencies = 9;
+  // `DivisionRule division_rules` (division-scoped `min_rest_minutes` /
+  // `max_fixtures_per_day`) retired 2026-08-12: `rule_groups` below was
+  // already authoritative in production, and every division-scoped rest/cap
+  // rule this field could ever carry was already mirrored there, so removing
+  // it changed no behaviour. Reserve, never reuse -- renumbering is never
+  // safe across the stg/prod deploy split.
+  reserved 10;
+  reserved "division_rules";
+  BuildConstraints constraints = 11;
+  double wall_seconds = 12;
+  // C1. Originally added ALONGSIDE `division_rules` (proto field 10, now
+  // retired -- see the `reserved` statement above) rather than replacing it:
+  // a contract revision ran on `placement-stg` while production still ran
+  // the previous one, so for that window both services had to tolerate the
+  // other's messages. Adding a field is safe in both directions under
+  // proto3; renumbering or repurposing one is not.
+  //
+  // That staged migration is complete. `division_rules` became redundant
+  // once the C1 model half landed and the rule_groups path was confirmed
+  // authoritative in production (2026-08-12), so it was retired outright
+  // rather than carrying a further release.
+  repeated RuleGroup rule_groups = 13;
+  // C10 (2026-08-16, wire person indices) -- the declared bound for every
+  // `Fixture.person_indices` value, exactly `entrant_count`'s role one
+  // namespace over. Declared rather than inferred for the same reason
+  // `entrant_count` is: an inferred bound (the largest index actually used)
+  // cannot distinguish "person 7" from a typo, a declared one can.
+  uint32 person_count = 14;
+}
+
+message SolveBuildResponse {
+  repeated Assignment assignments = 1;
+  SolveStatus status = 2;
+  int32 tiers_completed = 3;
+  repeated Tier objective_values = 4;
+  int64 elapsed_ms = 5;
+  bool wall_exhausted = 6;
+  SolveError error = 7;
+}
+
+service SchedulerService {
+  rpc SolveBuild(SolveBuildRequest) returns (SolveBuildResponse);
+}

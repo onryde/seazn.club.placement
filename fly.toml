@@ -1,0 +1,400 @@
+# =============================================================================
+# Placement scheduling service — Fly configuration
+#
+# THE CONFIG AT THE BOTTOM IS DELIBERATELY BARE. Every "why" lives up here in
+# numbered sections; each setting carries only a `# [n]` pointer back to one.
+# Restructured 2026-08-11 at the owner's request — the rationale had grown to
+# ten times the size of the settings and the file had become unreadable AS
+# CONFIG, which is what it is for.
+#
+# Nothing was dropped in the move. If a claim below looks stale, it is dated;
+# section [9] lists what is currently known to be UNRESOLVED.
+#
+#   [1] App identity, networking, and why this file is staging's too
+#   [2] Scale to zero — "suspend", and the .flycast trap
+#   [3] Concurrency — hard_limit and PLACEMENT_MAX_WORKERS are ONE decision
+#   [4] Health checks — why TCP and not gRPC Health/Check
+#   [5] Machine sizing — sized for PROOF TIME, not placement
+#   [6] Wall budget
+#   [7] Solver knobs
+#   [8] Secrets
+#   [9] Open questions and known contradictions
+#
+# -----------------------------------------------------------------------------
+# [1] APP IDENTITY AND NETWORKING
+#
+# Own Fly app, own image, deliberately separate from apps/web's (root
+# Dockerfile/fly.toml). gRPC over raw TCP, called by apps/web only over Fly's
+# private 6PN network (docs/superpowers/specs/2026-08-07-placement-scheduler-design.md,
+# "Security": shared-secret auth substitutes for mTLS specifically because 6PN
+# is already WireGuard-encrypted and not internet-reachable).
+#
+# DO NOT allocate a public IPv4/v6 for this app. That is a separate, explicit
+# `fly ips allocate-*` step nothing here performs, and doing it would
+# contradict the assumption the whole security model rests on.
+#
+# `app` MUST be exactly "placement". Fly's private DNS derives from the app
+# name, and `placement-client.ts`'s DEFAULT_HOST is the literal
+# "placement.flycast:50051" (placement-client.ts:157) — NOT
+# "placement.internal:50051" (an earlier draft of this comment said .internal;
+# see [2] for why .flycast is required once the machine can suspend). It only
+# yields to an explicit PLACEMENT_SERVICE_HOST env var. Naming this app
+# anything else breaks the zero-config path SILENTLY: every solve dials a host
+# that does not exist, the gRPC call fails, and build.ts falls back to greedy
+# placement with nothing surfacing why.
+#
+# SINCE 2026-08-11 that override IS in use: `seazn-club-stg` sets
+# PLACEMENT_SERVICE_HOST=placement-stg.flycast:50051, so staging calls its own
+# service rather than this one (DEPLOY.md §4b). It is set as a Fly secret on the
+# web app, not here — nothing in the repo names it, which is why an earlier
+# version of this comment said nothing sets it.
+#
+# THIS FILE IS ALSO STAGING'S. `placement-stg` deploys the same config with
+# `--app placement-stg`, deliberately: a forked TOML would be ~200 duplicated
+# lines, and each one that drifted would make staging a worse rehearsal for the
+# thing it exists to rehearse. Machine size, concurrency, health checks and
+# solver knobs must be production's for a staging result to mean anything.
+#
+# `primary_region` matches apps/web's root fly.toml — same Fly region, minimal
+# added latency for an RPC already budgeted to the second.
+#
+# -----------------------------------------------------------------------------
+# [2] SCALE TO ZERO — owner decision 2026-08-10
+#
+# Reverses this file's original "always warm" stance. The machine is sized for
+# proof time, so it is an expensive thing to leave idle between two organisers
+# clicking a button minutes apart.
+#
+# "suspend", NOT "stop", and the difference is the wall budget: a suspended
+# machine "preserve[s] memory and disk state, and resume[s] faster than
+# `stopped`" (Fly's machine-states docs). A cold start is ~1-3s, an eighth of
+# the 8-10s budget this whole investigation was built around; a resume is not.
+#
+# Billing for the suspended state is NOT documented by Fly (checked: the
+# pricing page covers `stopped` only, at $0.15/GB of rootfs per 30 days). The
+# expected cost either way is cents, against machine-hours that are not, so
+# this is a latency choice rather than a cost one. If an invoice ever
+# disagrees, "stop" is a one-word change and costs only the cold start.
+#
+# `min_machines_running = 0` is what actually permits zero. It only takes
+# effect "when auto_stop_machines is `stop` or `suspend`" (the docs' own
+# wording), so it was inert beside the previous "off".
+#
+# Fly's config reference documents both settings identically under
+# [http_service] and a generic [[services]] block — confirmed directly against
+# https://fly.io/docs/reference/configuration/ (fetched twice, independently,
+# after an earlier draft wrongly claimed min_machines_running exists only under
+# [http_service]; it does not).
+#
+# *** INERT — WORSE, SILENTLY HARMFUL — UNLESS THE CALLER DIALS `.flycast`. ***
+# Autostart is a Fly Proxy feature. `<app>.internal` bypasses the proxy and
+# resolves straight to machine IPs, so a suspended machine is simply
+# unreachable: `build.ts` catches the failure and returns a greedy board, which
+# looks like "placement lost on merit" rather than an outage. The private IPv6
+# that makes `.flycast` resolve is a ONE-TIME manual step
+# (`fly ips allocate-v6 --private`) that nothing here performs. See DEPLOY.md.
+#
+# -----------------------------------------------------------------------------
+# [3] CONCURRENCY — TWO NUMBERS, ONE DECISION
+#
+# Raised from 1/1 to 2/2 on 2026-08-11, owner's call.
+#
+# `[services.concurrency] hard_limit` and `[env] PLACEMENT_MAX_WORKERS` mean
+# different things and are only coherent TOGETHER:
+#
+#     hard_limit             when the PROXY stops sending connections here
+#     PLACEMENT_MAX_WORKERS  how many solves the SERVICE will admit at once
+#
+# A `hard_limit` ABOVE `PLACEMENT_MAX_WORKERS` is actively harmful, not merely
+# wasteful: the proxy hands a machine a second connection, the servicer's
+# bounded semaphore refuses it with `SOLVER_BUSY`, and `build.ts` turns that
+# into a GREEDY BOARD. The organiser gets a worse schedule and nothing says why
+# — it reads as "the optimiser got worse", the exact failure mode this file
+# keeps trying to make impossible. At 1/1 that state was unreachable.
+# WHOEVER RAISES ONE OF THESE RAISES THE OTHER IN THE SAME COMMIT.
+#
+# Why the block exists at all: it is the fan-out half of `fly scale count 10`
+# (DEPLOY.md step 5). The limit tells Fly Proxy when a machine is full so the
+# next solve is routed elsewhere, autostarting a suspended machine. Without it
+# the proxy has no reason to prefer an idle machine over the one it already
+# holds a connection to, however many are scaled up — this is what makes
+# `placement-client.ts`'s channel-per-solve change actually reach ten machines
+# instead of ten streams on one connection.
+#
+# `soft_limit` matches `hard_limit`: there is no useful middle state where the
+# proxy should prefer one warm machine over another before rejecting or
+# spawning.
+#
+# Raising it to 2 also closes an unresolved risk — see [9]: if a `tcp_checks`
+# connection counts toward this limit, `hard_limit = 1` could pin a machine at
+# "full" on its own health check and look permanently unavailable. At 2 there
+# is room for one check plus one solve either way.
+#
+# WHAT IT COSTS, stated now rather than discovered later. Two solves now share
+# one machine and CONTEND. `shared-cpu-2x` is 2 burstable vCPUs and
+# PLACEMENT_NUM_SEARCH_WORKERS is 8, so a full machine is 2 x 8 = 16 solver
+# threads on 2 throttled vCPUs where it was 8. That worker count was measured
+# on a 6-core dev box and is owed a re-measurement on this shape (DEPLOY.md
+# step 8); a dev-box A/B already found 4 workers beating both 8 and 12 under
+# load. Expect `tiers_completed` to degrade before `placed` does — [5] explains
+# why that ordering is the design and not an accident.
+#
+# Measurable, not arguable: every solve logs `workers=N symmetry=N probing=N`
+# with its own elapsed time. CHANGE ONE NUMBER AT A TIME — four production
+# deploys were already spent moving two at once and learning nothing.
+#
+# -----------------------------------------------------------------------------
+# [4] HEALTH CHECKS — TCP, not gRPC Health/Check, deliberately
+#
+# The Task 04 audit found the original health servicer shared the solve
+# ThreadPoolExecutor: under `max_workers` concurrent solves, Health/Check
+# returned DEADLINE_EXCEEDED, and a liveness probe using it would kill the
+# machine mid-solve, dropping every in-flight solve with it.
+#
+# That pool-exhaustion bug IS fixed (verified in src/placement/main.py): the
+# RPC pool is sized `max_workers + HEALTH_RESERVE_THREADS` (2 reserved threads
+# no solve can occupy) and SolveBuild is admission-controlled by a bounded
+# semaphore that refuses with SOLVER_BUSY instead of queueing, so Health/Check
+# keeps threads free even when the solver is saturated.
+#
+# But that fix has only been READ, not load-tested under real concurrent solves
+# — the base prompt's own stated condition for switching to a gRPC check — so
+# tcp_checks stays. It proves less (the port accepts a connection, not that the
+# service can answer), but it is unconditionally immune to this failure mode,
+# costs nothing, and a TCP accept was never the thing in question.
+#
+# -----------------------------------------------------------------------------
+# [5] MACHINE SIZING — SIZED FOR PROOF TIME, NOT PLACEMENT
+#
+# Across two independent paired, interleaved A/B runs of 12 on the production
+# board, `placed` was 37 of 37 fixtures in EVERY run regardless of load — this
+# machine size can never hand an organiser a broken or partial board. What
+# degrades under contention is `tiers_completed`: how much of the
+# T0(placed) -> T1(makespan) -> T2(idle gap) -> T3(court imbalance) chain the
+# solver PROVES inside the wall.
+#
+# This shape is sized to guarantee T0+T1 (every fixture placed, makespan proven
+# optimal) within budget under load; T2/T3 are best-effort on top, exactly the
+# degraded-but-valid shape measured on a contended dev box (status=FEASIBLE
+# placed=37 tiers_completed=2 elapsed_ms~8014). A failure whose `placed` is not
+# 37 would be a real bug, not a sizing tradeoff.
+#
+# Two oversubscription axes feed that risk and they MULTIPLY:
+#
+#   * PLACEMENT_NUM_SEARCH_WORKERS is 8, measured on a 6-physical-core dev box.
+#     shared-cpu-2x is 2 vCPU: unmeasured here, and plausibly oversubscribed
+#     even alone — a dev-box A/B already found 4 workers beating 8 and 12 under
+#     load (task-3-report.md, task-5b-report.md in the SDD workspace).
+#     Re-measure on this machine shape; since 2026-08-11 that is an `[env]`
+#     change here, NOT a Python edit and a deploy.
+#
+#   * PLACEMENT_MAX_WORKERS caps CONCURRENT solves. Every NUM_SEARCH_WORKERS
+#     measurement above was taken with exactly ONE solve in flight. At 2 the
+#     worst case is 16 threads on 2 vCPU; the old default of 4 would have been
+#     4 x 8 = 32, a ratio nothing in this programme has measured.
+#
+# [5a] PERFORMANCE-1X SINCE 2026-08-11 — owner's call, and a HYPOTHESIS to be
+# measured, not a settled improvement.
+#
+# The reasoning for trying it: `shared-cpu-2x` is 2 BURSTABLE vCPUs with a
+# baseline quota, and a CP-SAT solve saturates CPU for the entire wall. That is
+# precisely the shape a burstable allocation throttles — the machine looks like
+# 2 vCPUs on paper and behaves like rather less once credits run out, which
+# would show up as proof time rather than as an error. One DEDICATED vCPU is
+# slower on paper and steady in practice.
+#
+# WHY IT MIGHT BE WORSE, stated so the measurement is honest. CP-SAT's parallel
+# portfolio genuinely uses cores, and this trades two (throttled) for one
+# (dedicated). With `PLACEMENT_NUM_SEARCH_WORKERS = 8` and `hard_limit = 2` the
+# worst case is 16 solver threads on ONE core, where the previous shape gave
+# them two. If proof depth drops rather than rises, that is the answer and this
+# reverts to `shared-cpu-2x` / `1gb` in one edit.
+#
+# `memory = "2gb"` is NOT a separate choice: Fly requires at least 2gb per
+# performance vCPU, so it moves with `size` or the deploy is refused.
+#
+# COST IS REAL HERE, unlike most settings in this file. A performance vCPU is
+# several times a shared one, and DEPLOY.md step 5 scales this app to TEN
+# machines. Nine of them sit suspended almost all the time, which is the whole
+# reason scale-to-zero was adopted — but check the first invoice rather than
+# trusting that sentence, exactly as [9](c) already says for suspended billing.
+#
+# HOW TO JUDGE IT, and it is not "does it feel faster". Watch `tiers_completed`
+# on the per-solve log line, on the SAME board, against the recorded baseline:
+# T0+T1 within budget under load is what this shape is supposed to guarantee,
+# and `placed` should be full either way. Change nothing else in the same
+# deploy — the concurrency pair moved separately for this reason.
+#
+# A solve refused by admission control is not an error to the organiser:
+# `SOLVER_BUSY` (`schema.py:473`) reaches `placement-client.ts`'s `toOutcome`
+# as `status:"ERROR"` plus `error.code === "SOLVER_BUSY"`, which
+# `build.ts:1483-1484` maps to `greedy("solver_busy")` — a valid board, plus
+# copy (`board.result.busy`, all four locales) promising a retry helps. That is
+# a different answer from the LOCAL `MAX_SOLVER_QUEUE` admission gate's own
+# `"solver_busy"` (`MAX_SOLVER_QUEUE` in `build.ts`, in-process, ahead of this
+# call — it was the z3-WASM queue when it was written); both land on the same
+# status key on purpose.
+#
+# `[services.concurrency]` plus `fly scale count 10` is what turns "graceful
+# fallback for organiser #2" into "organiser #2 gets a real solve". Machine
+# COUNT carries the ten-organiser target, not per-machine concurrency.
+#
+# -----------------------------------------------------------------------------
+# [6] WALL BUDGET
+#
+# *** THE SERVER CAN HALVE THE CALLER'S WALL BUDGET, SILENTLY. ***
+# `main.py` clamps every request to `min(parsed.wall_seconds,
+# wall_seconds_max)`.
+#
+# THERE ARE TWO CEILINGS AND RAISING EITHER ONE ALONE IS INERT. The caller's
+# ASK is `PLACEMENT_WALL_SECONDS` on the WEB app (`autoSolverWallMs()`,
+# apps/web/src/server/usecases/schedule.ts), default 10. The server's CAP is
+# `PLACEMENT_WALL_SECONDS_MAX` below, default 10. A board gets the smaller of
+# the two. Raise the cap to 60 while the caller still asks 10 and every board
+# still gets 10; raise the ask while the cap is 10 and every board still gets
+# 10. Both, or nothing moves. They live in different apps and are deployed
+# separately, so this is easy to half-do and see no change.
+#
+# TWO THINGS MOVE WITH THE ASK, one of them automatically:
+#   * the per-org cooldown window is now DERIVED from it, holding one org to
+#     ~27% of an instance's solver capacity at any wall (it used to be a
+#     hand-re-derived constant, and had already been missed once);
+#   * `build.ts:286`'s size gate scales the admitted encoding by
+#     `wallMs / AUTO_SOLVER_WALL_MS_AT_MEASUREMENT`, so DOUBLING THE ASK
+#     DOUBLES THE BOARD SIZE ADMITTED. Boards previously refused start being
+#     solved. That is a behaviour change, not just more time, and it is not
+#     announced anywhere at runtime.
+#
+# Measured on a real 37-fixture, 3-board Auto-schedule (2026-08-10):
+#
+#     status=ok  engine=greedy  tiers_completed=1/4
+#     budget_expired=true  elapsed_ms=10644
+#
+# `status=ok` proves the solve REACHED the service — this was never the
+# fallback. What it did not get was time: the solver burned the whole 10s
+# completing only T0, so T1/T2/T3 never ran, and with no tier beyond T0 it had
+# no chance to strictly beat the greedy seed — which is exactly why `engine`
+# reads `greedy`. A generated 21-fixture round-robin stalls at 1/4 the same
+# way.
+#
+# `placed` is not what degrades — across 24 paired runs it was full placement
+# every time. What degrades is how much of the chain is PROVEN, which is the
+# thing this service exists to deliver over greedy.
+#
+# See [9]: the current value and the note that used to accompany it disagree,
+# and that is recorded rather than silently resolved.
+#
+# -----------------------------------------------------------------------------
+# [7] SOLVER KNOBS
+#
+# PLACEMENT_-prefixed, matching every other var this service reads. The
+# unprefixed `NUM_SEARCH_WORKERS` set here on 2026-08-10 did NOTHING —
+# `model.py` hardcoded the constant and `config.py` read only four vars — so
+# four production runs varied the wall and the machine while everyone believed
+# the worker count was moving. It never left 8.
+#
+# Since 2026-08-11 `config.py` reads all three solver knobs and `main.py`
+# passes them into the solve as a `SolverKnobs` value; the domain holds the
+# DEFAULTS only. So an unset variable here is not "8 hardcoded somewhere" — it
+# is `SolverKnobs`'s own default, and the two cannot disagree.
+#
+# The two presolve knobs are settable here too and are left UNSET, meaning the
+# shipped defaults (symmetry 0, probing 0). Set them to re-measure the
+# "~3x faster with them" tradeoff on a real board without a code deploy:
+#
+#     PLACEMENT_SYMMETRY_LEVEL = "2"
+#     PLACEMENT_PROBING_LEVEL  = "1"
+#
+# If a run comes back UNKNOWN with `placed` collapsing, that is the failure the
+# 0 guards against — loud in the response, and reverted by unsetting.
+#
+# -----------------------------------------------------------------------------
+# [8] SECRETS  (fly secrets set --app placement)
+#
+# PLACEMENT_SERVICE_SECRET — new, and distinct from apps/web's CRON_SECRET.
+# Never reuse that value; a shared secret would let either service
+# authenticate as the other. `placement-stg` carries its OWN value, not
+# production's (DEPLOY.md §4b).
+#
+# -----------------------------------------------------------------------------
+# [9] OPEN QUESTIONS AND KNOWN CONTRADICTIONS
+#
+# (a) WALL CEILING — THE FILE CONTRADICTED ITSELF, and this is preserved for
+#     the owner rather than guessed at. The setting is `"10"`. One paragraph
+#     beside it said "left UNSET here, so config.py's default of 10 applies";
+#     another said "RAISED FROM THE DEFAULT 10 TO 20 on 2026-08-10... 20
+#     matches what the caller actually asks for". All three cannot be true.
+#     RESOLVED 2026-08-11, and the resolution is the opposite of what the
+#     paragraph above concluded. The caller does NOT ask 20 — it asked 10, so
+#     NOTHING was being discarded, and the sentence "half the requested proof
+#     budget is therefore discarded on every board" was false at the time it
+#     was written. It argued for a change that would have been a no-op.
+#
+#     Both ends are now env vars (`PLACEMENT_WALL_SECONDS` on the web app,
+#     `PLACEMENT_WALL_SECONDS_MAX` here), both still 10, so the contradiction
+#     cannot recur silently: the cooldown window derives from the ask, and a
+#     malformed value is REFUSED rather than defaulted.
+#
+#     STILL OPEN, and genuinely: whether to raise them. It trades
+#     machine-seconds for proof depth on a box whose real shape has never been
+#     measured, and it also widens `build.ts:286`'s size gate (see [6]). Decide
+#     it as ONE change alongside the NUM_SEARCH_WORKERS re-measurement
+#     (DEPLOY.md step 8). Before spending any of it, note the 2026-08-11
+#     staging run burned the full 10s at `tiers=1/2` WITHOUT proving — if T1
+#     never closes its bound, more wall is wasted machine-seconds.
+#
+# (b) DO `tcp_checks` COUNT TOWARD `services.concurrency`? Still undocumented.
+#     Checked directly against https://fly.io/docs/reference/configuration/,
+#     https://fly.io/docs/networking/services/ and
+#     https://fly.io/docs/reference/fly-proxy/ (2026-08-10): none states
+#     whether a health-check connection is counted. Could not establish either
+#     way; flagged rather than assumed. `hard_limit = 2` makes it moot for now.
+#
+# (c) SUSPENDED-MACHINE BILLING — see [2]. Check the first invoice rather than
+#     trusting this file.
+# =============================================================================
+
+app = "placement"                     # [1] MUST be exactly this — .flycast DNS
+primary_region = "lhr"                # [1] matches apps/web
+
+[build]
+
+# [1] TCP, not [http_service]: that block is HTTP/1.1-oriented and tuned for
+# the web app's traffic shape. This is gRPC over raw TCP.
+[[services]]
+  internal_port = 50051
+  protocol = "tcp"
+  auto_stop_machines = "suspend"      # [2] "suspend", never "stop"
+  min_machines_running = 0            # [2] what actually permits zero
+
+  [[services.ports]]
+    port = 50051
+
+  # [3] MOVES IN LOCKSTEP WITH PLACEMENT_MAX_WORKERS. Never raise one alone.
+  [services.concurrency]
+    type       = "connections"
+    hard_limit = 2
+    soft_limit = 2
+
+  [[services.tcp_checks]]             # [4] TCP accept, not gRPC Health/Check
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]                                # [5] sized for PROOF TIME, not placement
+  size = "performance-1x"             # [5a] DEDICATED vCPU — see the note
+  memory = "2gb"                      # [5a] performance vCPUs require >= 2gb
+
+[env]
+  PLACEMENT_MAX_WORKERS = "2"         # [3] MUST be >= hard_limit above
+  PLACEMENT_WALL_SECONDS_MAX = "10"   # [6] the CAP. The caller's ASK is
+                                      #     PLACEMENT_WALL_SECONDS on the WEB
+                                      #     app, also 10. Raising one alone
+                                      #     does nothing.
+  # PLACEMENT_LOG_LEVEL = "DEBUG"     # default INFO. An unknown name warns on
+                                      #     stderr and falls back rather than
+                                      #     refusing to boot — unlike the knobs
+                                      #     above, it changes only what the
+                                      #     service PRINTS, and it is the one
+                                      #     setting you reach for mid-incident.
+  PLACEMENT_NUM_SEARCH_WORKERS = "8"  # [7] owed a re-measurement, DEPLOY.md §8

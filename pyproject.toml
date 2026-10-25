@@ -1,0 +1,58 @@
+[project]
+name = "placement-service"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "ortools>=9.15,<10",
+    # scheduler_pb2_grpc.py hard-embeds GRPC_GENERATED_VERSION='1.81.1' and
+    # raises RuntimeError at import if the installed grpcio is older, so
+    # >=1.81.1 is the actual runtime invariant, not a preference. On CPython
+    # 3.14 the floor itself is unreachable — 1.81.1 has no cp314 wheel — so
+    # this always resolves to 1.83.0 there (also what every test in this
+    # programme has run against); the constraint still does its job of
+    # rejecting anything genuinely older on whatever interpreter installs it.
+    "grpcio>=1.81.1,<2",
+    "grpcio-health-checking>=1.81.1,<2",
+    # ortools caps protobuf at <6.34; state it here so pip fails fast on a
+    # conflict instead of silently backtracking grpcio-tools off its pin.
+    "protobuf>=6.33.5,<6.34",
+    "structlog>=26,<27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    # The generated stubs are tracked in git, so the toolchain that produces
+    # them is pinned exactly — a different-but-legal resolution would emit
+    # different bytes and trip the drift gate in tests/test_proto_compiles.py.
+    # Dev-only: a gate is a TEST, and tests install this group. The prod
+    # image never regenerates stubs, so it has no business carrying a
+    # compiler toolchain (Prompt 08 correction 2).
+    "grpcio-tools==1.81.1",
+    # Exact, not a range, and pinned to 1.81.1 alongside grpcio-tools and
+    # grpcio-health-checking rather than to the installed grpcio (1.83.0).
+    # grpcio-testing ships the in-process `server_from_dictionary` harness
+    # tests/test_server.py runs the servicer through, and it carries a protobuf
+    # floor that moves with its version: 1.83.0 requires protobuf>=7.35.1,
+    # which ortools (protobuf<6.34) forbids. An unpinned `pip install
+    # grpcio-testing` therefore resolves to 1.83.0 and silently upgrades
+    # protobuf out from under ortools and the generated stubs — a dev-only
+    # dependency breaking the runtime. 1.81.1 requires protobuf<7 and
+    # grpcio>=1.81.1, so it sits inside every existing constraint.
+    "grpcio-testing==1.81.1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+# `bench/` is a standalone script directory, not an installed package, so
+# nothing puts it on sys.path. The service's acceptance tests import their
+# board from `bench/placement_bench_boards.py` deliberately — sharing the bench's
+# ONE generator rather than keeping a second copy that can drift — so the
+# directory has to be importable. `pythonpath` is native pytest (>=7), no
+# plugin, and it is preferred here over a `sys.path.insert` inside the test
+# file: an import hack in one test module silently stops working the moment a
+# second module needs the same path.
+pythonpath = ["bench"]

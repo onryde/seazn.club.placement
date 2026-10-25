@@ -1,0 +1,20 @@
+# Keeps local dev/build artifacts out of the image "true by construction"
+# rather than by accident of what happens to exist at build time. The
+# Dockerfile only ever COPYs `pyproject.toml` and `src/` explicitly (never
+# `COPY . .`), so nothing here can leak into the image from outside those
+# two paths regardless — but anything matching below that DOES live inside
+# `src/` (an editable install's build/egg-info, a stray __pycache__) would
+# otherwise be swept in verbatim by `COPY src/ src/`. Mirrors .gitignore,
+# but Docker does not read that file, so this one has to exist separately.
+__pycache__/
+**/__pycache__/
+*.pyc
+**/*.pyc
+*.egg-info/
+**/*.egg-info/
+build/
+**/build/
+.pytest_cache/
+**/.pytest_cache/
+venv/
+.venv/
