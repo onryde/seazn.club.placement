@@ -117,7 +117,7 @@ jobs:
         if: always()
         run: |
           flyctl status --app "$APP" || true
-          echo "::notice::DEPLOY.md step 5 sets 'fly scale count 10'. If the count above is not 10, the fan-out that makes hard_limit=1 useful is not in place."
+          echo "::notice::DEPLOY.md step 5 sets 'fly scale count 10'. If the count above is not 10, the fan-out that spreads solves across machines (fly.toml's hard_limit) is not in place."
         env:
           APP: ${{ steps.flycfg.outputs.app }}
           FLY_API_TOKEN: ${{ secrets.FLY_TOKEN }}

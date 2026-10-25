@@ -24,7 +24,15 @@ name: stg
 # STAGING FOLLOWS THE TIP OF MAIN. Two pushes can finish ci out of order, and the
 # older one would then deploy over the newer. Right before it deploys, the job asks
 # origin where main is; if it has moved on, this commit is skipped (a notice, not a
-# failure) and the newer commit's own run deploys that one.
+# failure) and the stg run for the newer commit deploys that one.
+#
+# That hand-off can be lost. The concurrency group below keeps one running run and
+# ONE PENDING run, and a newer pending run cancels the older pending one even with
+# cancel-in-progress: false (which protects only the run that is already going). So
+# if the run for the tip is cancelled while pending, nothing deploys the tip and
+# staging stays on an older commit until the next merge. The recovery: re-run the
+# cancelled stg run (Actions, stg, the cancelled run, Re-run all jobs); it is the
+# tip, so it deploys.
 #
 # Production is a separate workflow (prod.yml) and moves only on a v*.*.* tag in
 # this repository, so staging runs ahead of it. The gap between "merged to main"
@@ -122,6 +130,22 @@ jobs:
         id: tip
         run: bash scripts/require-main-tip.sh "$HEAD_SHA"
 
+      # If the step above is skipped, or fails and is ignored, it writes no answer, and
+      # every step below that waits for `current == 'true'` is skipped: a GREEN run
+      # that deployed nothing. This turns that into a red one. No `if:`, so it runs on
+      # success() and adds no second red to a run that has already failed.
+      - name: Require a decision from the tip check
+        run: |
+          case "$CURRENT" in
+            true|false) echo "tip check answered: current=$CURRENT" ;;
+            *)
+              echo "::error::the tip check left no answer (current='$CURRENT'). Not treating that as 'skip': nothing was deployed and nothing was checked."
+              exit 1
+              ;;
+          esac
+        env:
+          CURRENT: ${{ steps.tip.outputs.current }}
+
       # --image: Fly runs the published image as it is. Without it flyctl would
       # build a new one from this checkout, which is the untested build this
       # workflow exists to avoid. --no-public-ips: a deploy must never allocate
@@ -150,7 +174,7 @@ jobs:
         if: always() && steps.tip.outputs.current == 'true'
         run: |
           flyctl status --app placement-stg || true
-          echo "::notice::Deployed ${IMAGE} to placement-stg."
+          echo "::notice::Attempted a deploy of ${IMAGE} to placement-stg; the deploy step above says whether it succeeded."
           echo "::notice::VERIFY BY LOG ATTRIBUTION, not by reading the env var: run one Auto-schedule on stg.seazn.club, then 'fly logs --app placement-stg' must show a 'solve request=' line and 'fly logs --app placement' must show NOTHING for it. A misspelled PLACEMENT_SERVICE_HOST on seazn-club-stg silently routes staging to production."
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_TOKEN }}

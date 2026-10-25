@@ -1,7 +1,8 @@
 # Deploying the Placement service — owner runbook
 
 **Setup is by hand; routine deploys run in CI.** Sections 1–4 (the apps, the
-private IPv6, the secrets) are one-time owner steps. After that,
+private IPv6, the secrets, and the two things CI needs from you) are one-time owner
+steps. After that,
 `.github/workflows/ci.yml` tests and publishes the image on every push to `main`,
 and two more workflows deploy that published image without rebuilding it:
 `.github/workflows/stg.yml` (staging, once `ci` has passed) and
@@ -89,6 +90,25 @@ secret as `UNAUTHENTICATED` — which `placement-client.ts:507` maps to a failur
 and `build.ts` turns into a greedy board. A missing secret on the web app
 therefore looks exactly like "placement is slow", not like an auth error.
 
+### CI needs two more things from you, once
+
+CI can do neither of these for itself.
+
+1. **Set the `FLY_TOKEN` repository secret** (GitHub: Settings, Secrets and variables,
+   Actions) to a Fly token that can deploy both `placement` and `placement-stg`. It is
+   the only GitHub secret the deploy workflows use (§5).
+2. **Make the GHCR package `seazn-placement` public, once, after its first publish.**
+   `ci` creates the package the first time it publishes an image on `main`, and GitHub
+   creates it private. Fly pulls the image anonymously, so a private package cannot be
+   deployed (GitHub: Packages, `seazn-placement`, Package settings, Change visibility,
+   Public). It stays public after that.
+
+**The first `stg` run is expected to go RED**, at *Require the image ci published for
+this commit*, until step 2 is done: that check inspects the image anonymously, exactly
+as Fly will, so a private package fails it. That red is the check working, not a
+defect. Once the package is public, re-run that `stg` run (Actions, `stg`, the red run,
+*Re-run failed jobs*); nothing in the repository needs to change.
+
 ## 4b. Staging gets its OWN service, `placement-stg` (owner decision 2026-08-11)
 
 **This supersedes the 2026-08-10 decision to share.** Sharing was correct while
@@ -106,8 +126,13 @@ ten, and no way to validate a contract first — are both closed by the split.
 Staging deploys the **same** `fly.toml` with the app name overridden:
 
 ```bash
-fly deploy . --config fly.toml --app placement-stg
+fly deploy . --config fly.toml --app placement-stg --no-public-ips
 ```
+
+`--no-public-ips` on every manual deploy, as in CI: a first `fly deploy` on an app that
+holds no address allocates public ones (and the placement service must never have one).
+Step 2 gives the app its private v6 first, so allocation would be skipped anyway, but
+the flag makes that independent of the order you did things in.
 
 A second TOML would be ~200 lines duplicated, and every line that drifted would
 make staging a worse and worse rehearsal for production. The point of this app
@@ -252,7 +277,12 @@ second build.
   and then fail the job if `flyctl ips list` shows any address that is not a private
   v6 (§3). No workflow allocates an address.
 - `stg.yml` skips a commit that `main` has already moved past, so staging follows the
-  tip of `main`.
+  tip of `main`. The newer commit's own `stg` run deploys it, with one gap: the `stg`
+  concurrency group keeps one running run and one *pending* run, and a newer pending
+  run cancels the older pending one even though `cancel-in-progress` is `false`. If the
+  cancelled run was the one for the tip of `main`, staging stays behind until you
+  re-run the cancelled stg run (Actions, `stg`, the cancelled run, *Re-run all jobs*)
+  or the next merge lands.
 
 The standing rule that **no agent runs `fly deploy`** is unchanged; none
 does. CI is a different actor, gated on checks this service cannot run
@@ -263,7 +293,7 @@ The manual path below remains valid for a first deploy or a rollback. It builds 
 Fly's builder from your checkout:
 
 ```bash
-fly deploy . --app placement
+fly deploy . --app placement --no-public-ips
 ```
 
 To roll back to an image CI already tested, deploy that sha instead (the same flags
