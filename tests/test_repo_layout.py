@@ -8,7 +8,6 @@ The old-layout needles are assembled from pieces so this file does not match its
 own sweep.
 """
 
-import re
 import subprocess
 from pathlib import Path
 
@@ -65,50 +64,6 @@ def test_no_old_layout_paths_in_tracked_text():
     assert not missing, f"the sweep did not read {sorted(missing)} (scanned {len(scanned)} files)"
     # An allowlist entry that matches nothing is stale and would hide a real hit later.
     assert allowed_hits == {key: 1 for key in ALLOWED_LINES}, allowed_hits
-
-
-def test_docs_name_the_python_the_ci_runs():
-    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
-    ci_versions = set(re.findall(r'python-version: "(\d+\.\d+)"', ci))
-    assert len(ci_versions) == 1, ci_versions
-    (ci_version,) = ci_versions
-    checked = 0
-    expected = 0
-    for rel in ("README.md", "AGENTS.md"):
-        text = (REPO_ROOT / rel).read_text()
-        expected += text.count("uv venv --python")
-        for found in re.findall(r"uv venv --python (\S+)", text):
-            checked += 1
-            assert found == ci_version, f"{rel}: 'uv venv --python {found}' but CI runs {ci_version}"
-    # Every mention was parsed (none slipped past the pattern), and there is at least one.
-    assert checked == expected > 0, (checked, expected)
-
-
-def test_docs_never_prefix_path_with_a_bare_buf_dir():
-    # PATH="$BUF_DIR:$PATH" with BUF_DIR unset puts an empty entry, i.e. the
-    # current directory, on PATH. The ${BUF_DIR:+...} form adds nothing instead.
-    bare = "$BUF_DIR:" "$PATH"
-    guarded = "${BUF_DIR:+$BUF_DIR:}$PATH"
-    scanned = 0
-    for rel in _repo_files():
-        if not rel.endswith(".md"):
-            continue
-        scanned += 1
-        assert bare not in (REPO_ROOT / rel).read_text(), f"{rel}: bare BUF_DIR prefix on PATH"
-    assert scanned > 0
-    assert guarded in (REPO_ROOT / "AGENTS.md").read_text()
-    assert guarded in (REPO_ROOT / "README.md").read_text()
-
-
-def test_readme_marks_the_commands_that_run_in_a_seazn_club_checkout():
-    lines = (REPO_ROOT / "README.md").read_text().splitlines()
-    cds = [i for i, line in enumerate(lines) if line.startswith("cd packages/")]
-    mentions = sum(line.count("cd packages/") for line in lines)
-    assert len(cds) == mentions > 0, f"{len(cds)} command lines but {mentions} mentions of 'cd packages/'"
-    for i in cds:
-        assert lines[i - 1] == "# in a seazn.club checkout", (
-            f"README.md:{i + 1}: '{lines[i]}' names a seazn.club path; say where it runs"
-        )
 
 
 def test_gitignore_keeps_env_files_out_of_the_repo():

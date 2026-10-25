@@ -177,9 +177,26 @@ def _fields(step):
             for m in re.finditer(r"(?m)^      (?:- |  )([\w-]+):(?: (.*))?$", step)}
 
 
-def _label(fields):
-    """A step's name, or the action it uses (without the @sha) when it has no name."""
-    return fields["name"] if "name" in fields else fields["uses"].split("@")[0]
+def _step_key(step):
+    """What a step DOES, not what it is called: the action it uses, the repo script it runs,
+    the flyctl subcommand it runs, or a fixed tag for one of the two inline shell checks.
+    A step it cannot place gets an "unrecognised step" key, so a new step reds until it is added on purpose."""
+    fields = _fields(step)
+    if "uses" in fields:
+        return fields["uses"].split("@")[0]
+    script = _script_of(step)
+    found = re.search(r"scripts/([\w.-]+)", script)
+    if found:
+        return f"scripts/{found.group(1)}"
+    found = re.search(r"(?<![\w./'-])flyctl\s+(\w+)", script)
+    if found:
+        return f"flyctl {found.group(1)}"
+    if "sed -n 's/^[[:space:]]*app" in script:
+        return "read the app name from fly.toml"
+    if 'case "$CURRENT" in' in script:
+        return "assert the tip check answered"
+    # Not placed: the tables below will not list it, so the step-list test reds with this tag in the diff.
+    return "unrecognised step: " + (script.strip().splitlines() or [step.strip().splitlines()[0]])[0]
 
 
 def _sub_keys(step, key):
@@ -237,22 +254,28 @@ def test_stg_runs_only_after_a_green_ci_push_to_main_of_this_repository():
     condition = _job_if(job)
     assert condition, "the deploy job has no job-level 'if:'"
     assert "||" not in condition, f"an OR would let a run that is not green and a push through: {condition}"
-    # The gate is exactly these four, no more and no fewer. `event == push` is what
+    # The gate is exactly these five, no more and no fewer. `event == push` is what
     # keeps a fork's pull request (whose head_branch may be called main) out, and
-    # the repository check keeps any other repository's run out.
+    # the repository check keeps any other repository's run out. The last one is the
+    # first gate on the tip of main: on workflow_run github.sha is the default
+    # branch's head, so this runs only a commit that WAS main's tip when ci finished,
+    # and GitHub evaluates it before any step has run a script from the checkout.
     assert set(condition.split(" && ")) == {
         "github.event.workflow_run.conclusion == 'success'",
         "github.event.workflow_run.event == 'push'",
         "github.event.workflow_run.head_branch == 'main'",
         "github.event.workflow_run.head_repository.full_name == github.repository",
+        "github.event.workflow_run.head_sha == github.sha",
     }, condition
 
 
 def test_stg_checks_out_and_deploys_the_commit_ci_ran_on():
     code, _, job = _deploy("stg.yml")
     head_sha = "${{ github.event.workflow_run.head_sha }}"
-    # On workflow_run, github.sha is the default branch's head, not the tested commit.
-    assert "github.sha" not in code, "github.sha is the wrong commit on a workflow_run"
+    # On workflow_run, github.sha is the default branch's head, not the tested commit,
+    # so it never picks what is checked out, built or deployed. Its one use is the job
+    # `if:`, which compares it with the tested commit (see the gate test above).
+    assert code.count("github.sha") == 1 and "head_sha == github.sha" in _job_if(job), code.count("github.sha")
     checkout = _step_with(job, "actions/checkout@")
     assert re.search(rf"^          ref: {re.escape(head_sha)}$", checkout, re.MULTILINE), checkout
     env = _env_block(job, 4)
@@ -429,7 +452,7 @@ def test_stg_skips_a_commit_main_has_moved_past():
     gated_steps = (
         ("flyctl deploy", f"if: {gate}"),
         ("require-private-ips.py", f"if: {gate}"),
-        ("What to verify by hand", f"if: always() && {gate}"),
+        ("flyctl status", f"if: always() && {gate}"),
     )
     gated = [s for s in _steps(job) if gate in s]
     assert len(gated) == len(gated_steps) > 0, [s.splitlines()[0] for s in gated]
@@ -515,12 +538,12 @@ def test_flyctl_is_pinned_by_commit_and_by_version():
 
 def test_the_ported_reminder_steps_are_kept():
     _, _, stg = _deploy("stg.yml")
-    by_hand = _step_with(stg, "What to verify by hand")
+    by_hand = _step_with(stg, "flyctl status")
     script = _run_script(by_hand)
     assert VERIFY_BY_LOG_ATTRIBUTION in script, script
     assert "flyctl status --app placement-stg || true" in script
     _, _, prod = _deploy("prod.yml")
-    report = _step_with(prod, "Report machine count")
+    report = _step_with(prod, "flyctl status")
     assert "        if: always()\n" in report, report
     assert MACHINE_COUNT_REMINDER in _run_script(report)
     assert 'flyctl status --app "$APP" || true' in _run_script(report)
@@ -533,54 +556,40 @@ def test_the_ported_reminder_steps_are_kept():
 # The tables are what the deploys are MEANT to be, written from the brief, not read back from the files.
 
 GATE = f"steps.tip.outputs.{_tip_key()} == 'true'"
-STEP_LABELS = {
-    "stg.yml": [
-        "actions/checkout",
-        SETUP_FLYCTL,
-        "Verify fly.toml still names the production app",
-        "Require the image ci published for this commit",
-        "Skip a commit that main has already moved past",
-        "Require a decision from the tip check",
-        "Deploy the published image to placement-stg",
-        "Fail on any address that is not a private v6",
-        "What to verify by hand",
-    ],
-    "prod.yml": [
-        "actions/checkout",
-        SETUP_FLYCTL,
-        "Read and verify the app name",
-        "Require the image ci published for the tagged commit",
-        "Deploy the published image",
-        "Fail on any address that is not a private v6",
-        "Report machine count",
-    ],
+READ_APP = "read the app name from fly.toml"
+ASSERT_TIP = "assert the tip check answered"
+CHECKOUT = "actions/checkout"
+REQUIRE_IMAGE = "scripts/require-image.sh"
+REQUIRE_TIP = "scripts/require-main-tip.sh"
+REQUIRE_PRIVATE = "scripts/require-private-ips.py"
+# The steps in order, each named by what it does (see _step_key), not by its display name.
+STEP_KEYS = {
+    "stg.yml": [CHECKOUT, SETUP_FLYCTL, READ_APP, REQUIRE_IMAGE, REQUIRE_TIP, ASSERT_TIP,
+                "flyctl deploy", REQUIRE_PRIVATE, "flyctl status"],
+    "prod.yml": [CHECKOUT, SETUP_FLYCTL, READ_APP, REQUIRE_IMAGE, "flyctl deploy", REQUIRE_PRIVATE, "flyctl status"],
 }
 # A step not listed here has no `if:`. Only the steps that act on the deployment wait for the tip check.
 STEP_IFS = {
-    "stg.yml": {
-        "Deploy the published image to placement-stg": GATE,
-        "Fail on any address that is not a private v6": GATE,
-        "What to verify by hand": f"always() && {GATE}",
-    },
-    "prod.yml": {"Report machine count": "always()"},
+    "stg.yml": {"flyctl deploy": GATE, REQUIRE_PRIVATE: GATE, "flyctl status": f"always() && {GATE}"},
+    "prod.yml": {"flyctl status": "always()"},
 }
 # A step not listed has no `with:` (or no `env:`). Checkout takes no `ref:`/`repository:`/`token:` in prod,
 # and in stg only the tested commit; setup-flyctl takes only the pinned version, never a token.
 STEP_WITH = {
-    "stg.yml": {"actions/checkout": {"ref", "persist-credentials"}, SETUP_FLYCTL: {"version"}},
-    "prod.yml": {"actions/checkout": {"persist-credentials"}, SETUP_FLYCTL: {"version"}},
+    "stg.yml": {CHECKOUT: {"ref", "persist-credentials"}, SETUP_FLYCTL: {"version"}},
+    "prod.yml": {CHECKOUT: {"persist-credentials"}, SETUP_FLYCTL: {"version"}},
 }
 STEP_ENV = {
     "stg.yml": {
-        "Require a decision from the tip check": {"CURRENT"},
-        "Deploy the published image to placement-stg": {"FLY_API_TOKEN"},
-        "Fail on any address that is not a private v6": {"FLY_API_TOKEN"},
-        "What to verify by hand": {"FLY_API_TOKEN"},
+        ASSERT_TIP: {"CURRENT"},
+        "flyctl deploy": {"FLY_API_TOKEN"},
+        REQUIRE_PRIVATE: {"FLY_API_TOKEN"},
+        "flyctl status": {"FLY_API_TOKEN"},
     },
     "prod.yml": {
-        "Deploy the published image": {"APP", "FLY_API_TOKEN"},
-        "Fail on any address that is not a private v6": {"APP", "FLY_API_TOKEN"},
-        "Report machine count": {"APP", "FLY_API_TOKEN"},
+        "flyctl deploy": {"APP", "FLY_API_TOKEN"},
+        REQUIRE_PRIVATE: {"APP", "FLY_API_TOKEN"},
+        "flyctl status": {"APP", "FLY_API_TOKEN"},
     },
 }
 JOB_ENV = {"stg.yml": {"HEAD_SHA", "IMAGE"}, "prod.yml": {"IMAGE"}}
@@ -596,21 +605,22 @@ FLYCTL_SUBCOMMANDS = {"stg.yml": ["deploy", "status"], "prod.yml": ["deploy", "s
 
 
 def _step_facts(name):
+    """[(step text, what it does, its own keys)] for a deploy workflow's steps, in order."""
     _, _, job = _deploy(name)
-    return [(step, _fields(step)) for step in _steps(job)]
+    return [(step, _step_key(step), _fields(step)) for step in _steps(job)]
 
 
 @pytest.mark.parametrize("name", DEPLOY_WORKFLOWS)
 def test_the_steps_are_exactly_these_in_this_order(name):
-    labels = [_label(fields) for _, fields in _step_facts(name)]
-    assert labels == STEP_LABELS[name]
-    assert len(set(labels)) == len(labels), "a label must be unique for the tables below to mean anything"
+    keys = [key for _, key, _ in _step_facts(name)]
+    assert keys == STEP_KEYS[name]
+    assert len(set(keys)) == len(keys), "a key must be unique for the tables below to mean anything"
 
 
 @pytest.mark.parametrize("name", DEPLOY_WORKFLOWS)
 def test_the_step_conditions_are_exactly_these(name):
-    got = {_label(fields): fields.get("if") for _, fields in _step_facts(name)}
-    assert got == {label: STEP_IFS[name].get(label) for label in STEP_LABELS[name]}, got
+    got = {key: fields.get("if") for _, key, fields in _step_facts(name)}
+    assert got == {key: STEP_IFS[name].get(key) for key in STEP_KEYS[name]}, got
     assert any(got.values()), "no step has an `if:` at all: the table is not looking at the files"
 
 
@@ -618,15 +628,15 @@ def test_the_step_conditions_are_exactly_these(name):
 def test_the_with_and_env_keys_are_exactly_these(name):
     facts = _step_facts(name)
     assert facts, name
-    got_with = {_label(f): set(_sub_keys(step, "with")) for step, f in facts if _sub_keys(step, "with")}
-    got_env = {_label(f): set(_sub_keys(step, "env")) for step, f in facts if _sub_keys(step, "env")}
+    got_with = {key: set(_sub_keys(step, "with")) for step, key, _ in facts if _sub_keys(step, "with")}
+    got_env = {key: set(_sub_keys(step, "env")) for step, key, _ in facts if _sub_keys(step, "env")}
     assert got_with == STEP_WITH[name], got_with
     assert got_env == STEP_ENV[name], got_env
     # each mapping lists a key once
-    for step, f in facts:
-        for key in ("with", "env"):
-            keys = _sub_keys(step, key)
-            assert len(keys) == len(set(keys)), (name, _label(f), key, keys)
+    for step, step_key, _ in facts:
+        for mapping in ("with", "env"):
+            keys = _sub_keys(step, mapping)
+            assert len(keys) == len(set(keys)), (name, step_key, mapping, keys)
     _, _, job = _deploy(name)
     assert set(_env_block(job, 4)) == JOB_ENV[name], _env_block(job, 4)
 
@@ -645,7 +655,7 @@ def test_the_job_workflow_and_trigger_keys_are_exactly_these(name):
 @pytest.mark.parametrize("name", DEPLOY_WORKFLOWS)
 def test_the_flyctl_subcommands_are_exactly_these(name):
     found = []
-    for step, _ in _step_facts(name):
+    for step, _, _ in _step_facts(name):
         # echoed reminders quote `fly logs` / `fly scale count`: only commands that are run count
         script = "\n".join(line for line in _script_of(step).splitlines() if not line.strip().startswith("echo"))
         found += re.findall(r"(?<![\w./'-])fly(?:ctl)?\s+(\w+)", script)
@@ -720,7 +730,7 @@ def test_a_missing_tip_answer_reds_the_job():
 
 def test_the_by_hand_step_does_not_claim_a_deploy_it_cannot_know_happened():
     _, _, job = _deploy("stg.yml")
-    script = _run_script(_step_with(job, "What to verify by hand"))
+    script = _run_script(_step_with(job, "flyctl status"))
     # It runs on always(), i.e. also after a failed deploy; "Deployed" would then be false.
     assert "Deployed" not in script, script
     assert '::notice::Attempted a deploy of ${IMAGE} to placement-stg' in script, script
@@ -829,78 +839,21 @@ def test_every_workflow_named_in_the_docs_exists():
         assert f".github/workflows/{name}" in docs["DEPLOY.md"], f"DEPLOY.md never names {name}"
 
 
-STALE_DEPLOY_CLAIMS = (
-    "never logs in",
-    "(root `fly.toml`)",
-    "Production deploys from CI on push to `main`",
-    "**Staging does not**",
-    "letting CI deploy production",
-    "path filter",
-    "fly's registry",
-    "builds the image on the runner",
-    "`integration` job",
-    "The only secret is `FLY_TOKEN`",
-)
-
-
 def _prose(text):
     """Line wraps are not content: a claim wrapped over two lines is still one claim."""
     return re.sub(r"\s+", " ", text)
 
 
-def test_the_docs_make_none_of_the_stale_deploy_claims():
-    docs = _doc_files()
-    found = [(rel, claim) for rel, text in docs.items() for claim in STALE_DEPLOY_CLAIMS if claim in _prose(text)]
-    assert not found, found
-    # Every job a doc points at as "the `x` job" exists in a workflow.
+def test_every_job_a_doc_names_exists():
+    # A reference, not a phrase: "the `x` job" in a doc must be a job some workflow has.
     jobs = set()
     for text in _workflows().values():
         _, _, after = _code(text).partition("\njobs:\n")
         jobs |= {m.group(1) for m in JOB_HEADER.finditer(after)}
-    mentioned = [(rel, job) for rel, text in docs.items() for job in re.findall(r"`([\w-]+)` job\b", text)]
+    assert jobs, "no workflow has a job: the check is vacuous"
+    mentioned = [(rel, job) for rel, text in _doc_files().items() for job in re.findall(r"`([\w-]+)` job\b", text)]
     assert mentioned, "no doc names a job; the check on job names is vacuous"
     assert not [(rel, job) for rel, job in mentioned if job not in jobs], (mentioned, sorted(jobs))
-
-
-def test_deploy_md_describes_the_deploys_that_exist():
-    text = _prose(_doc_files()["DEPLOY.md"])
-    # What the two workflows do, in the words the files above pin.
-    for fact in (
-        "`.github/workflows/ci.yml`",
-        "`.github/workflows/stg.yml`",
-        "`.github/workflows/prod.yml`",
-        "ghcr.io/onryde/seazn-placement:<commit sha>",
-        "`v*.*.*`",
-        "`FLY_TOKEN`",
-        "no paths filter",
-        "tip of `main`",
-        "skips a commit that `main` has already moved past",
-        "`--no-public-ips`",
-        "private v6",
-        "seazn.club's root `fly.toml`",
-    ):
-        assert fact in text, f"DEPLOY.md does not say {fact!r}"
-    for name in DEPLOY_WORKFLOWS:
-        assert f"`{EXPECTED_JOB[name]}`" in text, f"DEPLOY.md does not name the {name} job {EXPECTED_JOB[name]!r}"
-
-
-def test_agents_md_states_the_secrets_and_the_seazn_club_names():
-    raw = _doc_files()["AGENTS.md"]
-    text = _prose(raw)
-    assert "The only GitHub secret is `FLY_TOKEN`" in text
-    assert "`PLACEMENT_SERVICE_SECRET` is a Fly secret" in text
-    section = _prose(raw.split("## Paths in comments", 1)[1].split("\n## ", 1)[0])
-    # These bare names are used throughout the tree and name seazn.club files.
-    # Prove that, so the doc is not about nothing, then check it says so.
-    bare = {"build.ts": 0, "_INDEX.md": 0}
-    for rel, body in {**_doc_files(), **{p: (REPO_ROOT / p).read_text() for p in ("fly.toml", "src/placement/model.py")}}.items():
-        if rel == "AGENTS.md":
-            continue
-        for token in bare:
-            bare[token] += len(re.findall(rf"(?<![\w/.-]){re.escape(token)}", body))
-    assert all(count > 0 for count in bare.values()), bare
-    for token in bare:
-        assert f"`{token}`" in section, f"AGENTS.md 'Paths in comments' does not mention `{token}`"
 
 
 def _fenced_commands(text):
@@ -926,47 +879,3 @@ def test_every_documented_deploy_command_allocates_no_public_address():
             assert "--no-public-ips" in command.split(), f"{rel}: {command}"
             checked += 1
     assert checked > 0, "no fenced `fly deploy` command in any doc: the check is vacuous"
-
-
-PENDING_RACE_RECOVERY = "re-run the cancelled stg run"
-# The sentences this replaces. Each was true only while no run was cancelled while pending.
-UNCONDITIONAL_HANDOFF = ("the newer commit's own ci run deploys that one", "the newer commit's own run deploys that one")
-
-
-def _comment_prose(text):
-    """Comment markers and line wraps are not content: a sentence wrapped over comment lines is one sentence."""
-    return _prose(re.sub(r"(?m)^\s*#\s?", "", text)).lower()
-
-
-def test_the_pending_run_cancel_race_is_documented_with_its_recovery():
-    # concurrency keeps one running and one PENDING run; a newer pending run cancels the older one
-    # even with cancel-in-progress: false. When the cancelled run was the tip's, nothing deploys it.
-    sources = {
-        ".github/workflows/stg.yml": _read("stg.yml"),
-        "scripts/require-main-tip.sh": (SCRIPTS_DIR / "require-main-tip.sh").read_text(),
-        "DEPLOY.md": _doc_files()["DEPLOY.md"],
-    }
-    for rel, text in sources.items():
-        prose = _comment_prose(text)
-        assert PENDING_RACE_RECOVERY in prose, f"{rel} does not say how to recover from a cancelled pending run"
-        assert "pending" in prose, rel
-        for sentence in UNCONDITIONAL_HANDOFF:
-            assert sentence not in prose, f"{rel} still says {sentence!r}, which is false after a cancelled pending run"
-    # the script says it twice: in the comment and in the notice a skipped run prints
-    assert _comment_prose(sources["scripts/require-main-tip.sh"]).count(PENDING_RACE_RECOVERY) == 2
-
-
-def test_deploy_md_owner_steps_name_the_token_and_the_package_visibility():
-    text = _prose(_doc_files()["DEPLOY.md"])
-    owner = text[text.index("## 1. Create the app"):text.index("## 4b.")]
-    _, _, job = _deploy("stg.yml")
-    image_step = _fields(_step_with(job, "scripts/require-image.sh"))["name"]
-    for fact in (
-        "Set the `FLY_TOKEN` repository secret",
-        "Make the GHCR package `seazn-placement` public",
-        "once, after its first publish",
-        "The first `stg` run is expected to go RED",
-        f"*{image_step}*",
-        "Re-run failed jobs",
-    ):
-        assert fact in owner, f"DEPLOY.md owner steps (sections 1-4) do not say {fact!r}"

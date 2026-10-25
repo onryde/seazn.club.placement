@@ -17,14 +17,26 @@ name: stg
 #   * ci finished with conclusion `success`,
 #   * for a `push` (never a pull_request: workflow_run runs with this repo's
 #     secrets even for a fork's pull request, whose head_branch can be named main),
-#   * to `main`, in THIS repository.
+#   * to `main`, in THIS repository,
+#   * and for the commit that is the head of main right now: `head_sha == github.sha`.
+#     On workflow_run github.sha is the default branch's head, so this admits only a
+#     commit that was main's tip when ci finished. It is the first gate on the tip,
+#     and it is in this `if:` (not in a script) because GitHub evaluates it before any
+#     step runs. A workflow_run always runs the default branch's copy of this file, so
+#     the pushed commit cannot edit the gate either. Without it, the checkout and the
+#     scripts in it (require-image.sh, then require-main-tip.sh itself) would run from
+#     whatever commit ci happened to finish for, before anything had checked that it
+#     is still main. The second check, just before the deploy, covers the wait in the
+#     queue below (see STAGING FOLLOWS THE TIP).
 #
 # No paths filter: the whole repository is the service.
 #
 # STAGING FOLLOWS THE TIP OF MAIN. Two pushes can finish ci out of order, and the
-# older one would then deploy over the newer. Right before it deploys, the job asks
-# origin where main is; if it has moved on, this commit is skipped (a notice, not a
-# failure) and the stg run for the newer commit deploys that one.
+# older one would then deploy over the newer. The job `if:` above skips a run whose
+# commit was already not the tip when ci finished. Right before it deploys, the job
+# asks origin where main is now; if it has moved on while the run waited, this commit
+# is skipped (a notice, not a failure) and the stg run for the newer commit deploys
+# that one.
 #
 # That hand-off can be lost. The concurrency group below keeps one running run and
 # ONE PENDING run, and a newer pending run cancels the older pending one even with
@@ -76,7 +88,7 @@ env:
 jobs:
   deploy-stg:
     name: Deploy to placement-stg
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.head_sha == github.sha
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Its OWN group. A staging deploy must never queue behind, or cancel, a
