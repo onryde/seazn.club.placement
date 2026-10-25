@@ -537,3 +537,105 @@ def test_fly_toml_stays_a_raw_tcp_service_with_no_http_handler():
             body.append(line.split("#")[0].strip())
     assert body == ["port = 50051"], body
     assert re.search(r'^\s*protocol\s*=\s*"tcp"\s*$', code, re.MULTILINE), "the service is raw TCP"
+
+
+# --- the docs ---------------------------------------------------------------------------------------------
+
+
+def _doc_files():
+    result = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+                            cwd=REPO_ROOT, capture_output=True, check=True)
+    names = sorted(n for n in result.stdout.decode().split("\0") if n.endswith(".md"))
+    return {rel: (REPO_ROOT / rel).read_text() for rel in names}
+
+
+def test_every_workflow_named_in_the_docs_exists():
+    docs = _doc_files()
+    assert {"DEPLOY.md", "README.md", "AGENTS.md"} <= set(docs), sorted(docs)
+    existing = set(_workflows())
+    named = []
+    loose = 0
+    for rel, text in docs.items():
+        loose += len(re.findall(r"\.yml\b", text))
+        named += [(rel, name) for name in re.findall(r"(?<![\w.-])([\w-]+\.yml)\b", text)]
+    # Every `.yml` mention was parsed as a file name, and there is at least one.
+    assert len(named) == loose > 0, (len(named), loose)
+    missing = sorted({(rel, name) for rel, name in named if name not in existing})
+    assert not missing, f"docs name workflows that do not exist: {missing}"
+    # And the reverse for DEPLOY.md: it describes every workflow that does exist.
+    for name in existing:
+        assert f".github/workflows/{name}" in docs["DEPLOY.md"], f"DEPLOY.md never names {name}"
+
+
+STALE_DEPLOY_CLAIMS = (
+    "never logs in",
+    "(root `fly.toml`)",
+    "Production deploys from CI on push to `main`",
+    "**Staging does not**",
+    "letting CI deploy production",
+    "path filter",
+    "fly's registry",
+    "builds the image on the runner",
+    "`integration` job",
+    "The only secret is `FLY_TOKEN`",
+)
+
+
+def _prose(text):
+    """Line wraps are not content: a claim wrapped over two lines is still one claim."""
+    return re.sub(r"\s+", " ", text)
+
+
+def test_the_docs_make_none_of_the_stale_deploy_claims():
+    docs = _doc_files()
+    found = [(rel, claim) for rel, text in docs.items() for claim in STALE_DEPLOY_CLAIMS if claim in _prose(text)]
+    assert not found, found
+    # Every job a doc points at as "the `x` job" exists in a workflow.
+    jobs = set()
+    for text in _workflows().values():
+        _, _, after = _code(text).partition("\njobs:\n")
+        jobs |= {m.group(1) for m in JOB_HEADER.finditer(after)}
+    mentioned = [(rel, job) for rel, text in docs.items() for job in re.findall(r"`([\w-]+)` job\b", text)]
+    assert mentioned, "no doc names a job; the check on job names is vacuous"
+    assert not [(rel, job) for rel, job in mentioned if job not in jobs], (mentioned, sorted(jobs))
+
+
+def test_deploy_md_describes_the_deploys_that_exist():
+    text = _prose(_doc_files()["DEPLOY.md"])
+    # What the two workflows do, in the words the files above pin.
+    for fact in (
+        "`.github/workflows/ci.yml`",
+        "`.github/workflows/stg.yml`",
+        "`.github/workflows/prod.yml`",
+        "ghcr.io/onryde/seazn-placement:<commit sha>",
+        "`v*.*.*`",
+        "`FLY_TOKEN`",
+        "no paths filter",
+        "tip of `main`",
+        "skips a commit that `main` has already moved past",
+        "`--no-public-ips`",
+        "private v6",
+        "seazn.club's root `fly.toml`",
+    ):
+        assert fact in text, f"DEPLOY.md does not say {fact!r}"
+    for name in DEPLOY_WORKFLOWS:
+        assert f"`{EXPECTED_JOB[name]}`" in text, f"DEPLOY.md does not name the {name} job {EXPECTED_JOB[name]!r}"
+
+
+def test_agents_md_states_the_secrets_and_the_seazn_club_names():
+    raw = _doc_files()["AGENTS.md"]
+    text = _prose(raw)
+    assert "The only GitHub secret is `FLY_TOKEN`" in text
+    assert "`PLACEMENT_SERVICE_SECRET` is a Fly secret" in text
+    section = _prose(raw.split("## Paths in comments", 1)[1].split("\n## ", 1)[0])
+    # These bare names are used throughout the tree and name seazn.club files.
+    # Prove that, so the doc is not about nothing, then check it says so.
+    bare = {"build.ts": 0, "_INDEX.md": 0}
+    for rel, body in {**_doc_files(), **{p: (REPO_ROOT / p).read_text() for p in ("fly.toml", "src/placement/model.py")}}.items():
+        if rel == "AGENTS.md":
+            continue
+        for token in bare:
+            bare[token] += len(re.findall(rf"(?<![\w/.-]){re.escape(token)}", body))
+    assert all(count > 0 for count in bare.values()), bare
+    for token in bare:
+        assert f"`{token}`" in section, f"AGENTS.md 'Paths in comments' does not mention `{token}`"

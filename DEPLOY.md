@@ -1,9 +1,12 @@
 # Deploying the Placement service — owner runbook
 
-**You run this by hand.** CI builds the image and runs the container, but
-never logs in, pushes, or deploys — deliberately
-(`.github/workflows/stg.yml` / `prod.yml`). No agent in this programme
-runs `fly deploy`.
+**Setup is by hand; routine deploys run in CI.** Sections 1–4 (the apps, the
+private IPv6, the secrets) are one-time owner steps. After that,
+`.github/workflows/ci.yml` tests and publishes the image on every push to `main`,
+and two more workflows deploy that published image without rebuilding it:
+`.github/workflows/stg.yml` (staging, once `ci` has passed) and
+`.github/workflows/prod.yml` (production, on a `v*.*.*` tag) — see §5. No agent in
+this programme runs `fly deploy`.
 
 Run every command from the repository root. The repository root is the build
 context: the `Dockerfile` copies `pyproject.toml` and `src/` relative to
@@ -14,7 +17,7 @@ Two names are load-bearing and must not be changed:
 | | |
 |---|---|
 | Service app | `placement` — Fly's private DNS derives from the app name, and `packages/scheduler/src/placement-client.ts`'s `DEFAULT_HOST` is the literal `placement.flycast:50051` |
-| Web app | `seazn-club-prod` (root `fly.toml`) |
+| Web app | `seazn-club-prod` (seazn.club's root `fly.toml`) |
 
 Rename the service app and every solve dials a host that does not exist: the
 gRPC call fails, `build.ts` falls back to greedy, and **nothing surfaces
@@ -204,17 +207,21 @@ regression in the thing they were testing.
 
 ### Deploying a contract change — the reason all of the above exists
 
-Production deploys from CI on push to `main` (step 5). **Staging does not**, and
-must not: if both deployed from `main` they would always be the same revision
+Staging and production deploy from different triggers (step 5), so they can run
+different revisions. `stg.yml` deploys the tip of `main` as soon as `ci` has passed
+and published its image; `prod.yml` moves only when someone pushes a `v*.*.*` tag.
+The gap between "merged" and "tagged" is the rehearsal window, and it is why the
+two must not deploy from the same trigger: they would always be the same revision
 and there would be no window to validate anything in.
 
 So a contract revision goes:
 
-1. `fly deploy . --config fly.toml --app placement-stg`
-   **from the feature branch**, before the PR merges.
+1. Merge the PR. `ci` publishes `ghcr.io/onryde/seazn-placement:<commit sha>` and
+   `stg.yml` deploys that image to `placement-stg`.
 2. Exercise it on `stg.seazn.club` — a real Auto-schedule on a real board, and
    confirm the per-solve log line comes from `placement-stg`.
-3. Only then merge, letting CI deploy production.
+3. Only then push the release tag, letting `prod.yml` deploy the same image to
+   production.
 
 Between 1 and 3 the two services run **different contracts**, which is the
 point. Both sides must therefore still tolerate the other's messages for that
@@ -223,22 +230,48 @@ or repurposed field number is not**, and no runbook step can save you from one.
 
 ## 5. Deploy
 
-**Deploys now run in CI** (`.github/workflows/stg.yml` / `prod.yml`, the
-`deploy` job): stg on every push to `main`, prod on a `v*.*.*` tag. It builds the image on
-the runner, pushes it to fly's registry, and deploys that digest — so what
-ships is the exact artifact the `integration` job proved answers gRPC, rather
-than a rebuild. It requires the `FLY_TOKEN` GitHub secret.
+**Deploys run in CI, from the published image. Nothing rebuilds it.** On every
+push to `main`, `.github/workflows/ci.yml` builds the image once, smoke-tests it in
+its `docker` job, and — after every gate — its `publish` job pushes that same image
+as `ghcr.io/onryde/seazn-placement:<commit sha>` (public; an immutable sha tag,
+never `latest`). The two deploy workflows ship exactly that image, so what runs is
+the artifact the `docker` job proved starts and accepts a TCP connection, not a
+second build.
+
+| Workflow | Job | Runs | Deploys |
+|---|---|---|---|
+| `.github/workflows/stg.yml` | `deploy-stg` | when `ci` succeeds for a push to `main`, while that commit is still the tip of `main` | that commit's image to `placement-stg` |
+| `.github/workflows/prod.yml` | `deploy` | on a `v*.*.*` tag | the tagged commit's image to `placement` |
+
+- There is no paths filter: the whole repository is the service.
+- Both fail before deploying if the commit has no published image (or its package is
+  not public, because Fly pulls it anonymously). For `prod.yml` that is the gate: a
+  tag does not run `ci`, so a tag on a commit that never passed on `main`, or one whose
+  `ci` is still running, stops there.
+- Both need the `FLY_TOKEN` GitHub secret, pass `--no-public-ips` to `flyctl deploy`,
+  and then fail the job if `flyctl ips list` shows any address that is not a private
+  v6 (§3). No workflow allocates an address.
+- `stg.yml` skips a commit that `main` has already moved past, so staging follows the
+  tip of `main`.
 
 The standing rule that **no agent runs `fly deploy`** is unchanged; none
 does. CI is a different actor, gated on checks this service cannot run
 anywhere else — the developer machine has no container runtime, so the
 `docker` job is the only place this image is ever built.
 
-The manual path below remains valid for a first deploy, a rollback, or any
-deploy outside that path filter:
+The manual path below remains valid for a first deploy or a rollback. It builds on
+Fly's builder from your checkout:
 
 ```bash
 fly deploy . --app placement
+```
+
+To roll back to an image CI already tested, deploy that sha instead (the same flags
+the workflow uses):
+
+```bash
+fly deploy --config fly.toml --app placement --no-public-ips \
+  --image ghcr.io/onryde/seazn-placement:<commit sha>
 ```
 
 `fly.toml` pins `auto_stop_machines = "suspend"` with

@@ -19,8 +19,9 @@ commit and is never rewritten.
 ## Paths in comments
 
 A path that starts with `packages/` or `apps/` (and the occasional `docs/`) in a
-comment or a doc here names a **seazn.club** file, not a file in this repo. Do not
-"fix" those references.
+comment or a doc here names a **seazn.club** file, not a file in this repo. So does a
+bare TypeScript file name such as `build.ts` or `placement-client.ts`, and so does
+`_INDEX.md`. Do not "fix" those references.
 
 ## The proto rule
 
@@ -40,12 +41,18 @@ The order for a contract change is:
 
 ## Deploys
 
-- stg (`placement-stg`) on every push to `main`.
-- prod (`placement`) on a `v*.*.*` tag.
-- The only artifact is the public image `ghcr.io/onryde/seazn-placement:<sha>`,
-  published from `main`. Tags are immutable commit shas: no `latest`, no `main`.
-- The only secret is `FLY_TOKEN`.
-- No public IP, ever: the apps are reached over private IPv6 only.
+- stg (`placement-stg`, `stg.yml`) deploys that commit's published image when `ci`
+  succeeds for a push to `main`, and only while the commit is still the tip of `main`.
+- prod (`placement`, `prod.yml`) deploys the tagged commit's published image on a
+  `v*.*.*` tag, and fails if there is none.
+- Neither rebuilds. The only artifact is the public image
+  `ghcr.io/onryde/seazn-placement:<sha>`, published by `ci.yml` from `main`. Tags are
+  immutable commit shas: no `latest`, no `main`.
+- The only GitHub secret is `FLY_TOKEN`. `PLACEMENT_SERVICE_SECRET` is a Fly secret,
+  set by hand on the Fly apps (DEPLOY.md §4); no workflow reads it.
+- No public IP, ever: the apps are reached over private IPv6 only. Both deploys pass
+  `--no-public-ips` and fail on any address that is not a private v6, and no workflow
+  allocates one.
 
 ## Tests
 
