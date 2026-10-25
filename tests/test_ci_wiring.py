@@ -220,6 +220,8 @@ def test_docker_exports_the_tested_image_and_publish_pushes_that_one():
     # The tar is the whole image: a day is enough for the publish job of this run
     # and no longer than that is wanted (a copy of the image outlives the run).
     assert "          retention-days: 1\n" in upload, upload
+    # The tar is already layer-compressed: zipping it again spends CPU for almost nothing.
+    assert "          compression-level: 0\n" in upload, upload
     artifact = re.search(r"^          name: (\S+)$", upload, re.MULTILINE).group(1)
 
     # publish takes that artifact; it builds nothing.

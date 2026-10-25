@@ -180,8 +180,9 @@ jobs:
       # job would be a supply-chain surprise, not a convenience. Pushing belongs
       # to the publish job, which alone holds `packages: write`.
       #
-      # `labels:` links the package to this repo, which is what lets the
-      # package inherit the repo's visibility and be managed from it.
+      # `labels:` links the package to this repo (the package page shows the repo
+      # and the repo's access applies to it). It does NOT set visibility: a new
+      # package is private until its owner makes it public, once (DEPLOY.md, §4).
       - name: Build the placement service image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -270,6 +271,7 @@ jobs:
           path: ${{ runner.temp }}/placement-image.tar
           retention-days: 1
           if-no-files-found: error
+          compression-level: 0
 
   # ---------------------------------------------------------------------
   # proto/scheduler.proto is additive-only: seazn.club vendors a copy of it
