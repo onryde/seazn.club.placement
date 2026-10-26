@@ -879,3 +879,37 @@ def test_every_documented_deploy_command_allocates_no_public_address():
             assert "--no-public-ips" in command.split(), f"{rel}: {command}"
             checked += 1
     assert checked > 0, "no fenced `fly deploy` command in any doc: the check is vacuous"
+
+
+def _deploy_md_section_5():
+    text = (REPO_ROOT / "DEPLOY.md").read_text()
+    assert text.count("\n## 5. Deploy\n") == 1 and text.count("\n## 6. ") == 1, "DEPLOY.md's section 5 is not where this reads it"
+    return text.split("\n## 5. Deploy\n", 1)[1].split("\n## 6. ", 1)[0]
+
+
+def test_the_first_production_tag_is_gated_on_the_stg_auto_schedule_check():
+    # Owner ruling: the stg Auto-schedule end-to-end check (O7) is a hard prerequisite before the
+    # FIRST v*.*.* tag. No workflow enforces it, so the checklist IS the gate: it must open the
+    # production section, ahead of the table that names prod.yml.
+    section = _deploy_md_section_5()
+    heading = "### Before the FIRST production tag"
+    table = "| Workflow | Job |"
+    assert section.lstrip().startswith(heading), section[:200]
+    assert section.count(heading) == 1 and table in section
+    checklist = section[:section.index(table)]
+    items = re.findall(r"(?m)^- \[ \] (.+(?:\n  .+)*)", checklist)
+    assert len(items) >= 4, f"the checklist has {len(items)} unticked items"
+    # The steps, each from the runbook's own wording: the stg host override, a multi-court run
+    # reporting the optimised engine, and the log attribution that tells stg from prod.
+    for needle in ("`placement-stg`", "PLACEMENT_SERVICE_HOST", "multi-court", "`optimized`", "`solve request=`"):
+        assert needle in _prose(" ".join(items)), needle
+    assert "hard prerequisite" in heading + checklist and "v*.*.*" in checklist
+
+
+def test_the_ghcr_package_note_describes_the_recreated_package_not_the_old_link():
+    # The package was deleted and recreated on 2026-10-25 and is linked to this repository. The note
+    # used to say its source "may still name another repository" (onryde/seazn.club); that is moot.
+    text = _prose((REPO_ROOT / "DEPLOY.md").read_text())
+    assert "onryde/seazn.club.placement" in text and "deleted and recreated" in text
+    for stale in ("may still name another repository", "fc5862f888", "feat/e2e-image-split", "is cosmetic"):
+        assert stale not in text, stale
