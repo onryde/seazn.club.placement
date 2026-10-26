@@ -122,13 +122,13 @@ package is *created*; it grants nothing on one that already exists. So a denial 
 gh api orgs/onryde/packages/container/seazn-placement   # needs the read:packages scope
 ```
 
-`repository` names the source repository the package is linked to and `visibility`
-should read `public`. After the fix `repository` (the UI's *Repository source*) may
-still name another repository: here it is `onryde/seazn.club`, because the package was
-first created on 2026-09-09 by seazn.club's build-and-dispatch workflow (commit
-fc5862f888, branch `feat/e2e-image-split`). That link is set by the package's first
-version and is cosmetic; access comes from *Manage Actions access*. Fix it once, in the
-package's settings (GitHub: Packages, `seazn-placement`, Package settings):
+`repository` names the source repository the package is linked to (the UI's *Repository
+source*) and `visibility` should read `public`. Today `repository` reads
+`onryde/seazn.club.placement`: the package was deleted and recreated on 2026-10-25, by this
+repository's own `publish` job, so it carries this repository as its source. If `repository`
+ever names another repository, the package was created from there and Actions access to it
+must be granted by hand. Do that in the package's settings (GitHub: Packages,
+`seazn-placement`, Package settings):
 
 1. Untick *Inherit access from source repository*.
 2. Under *Manage Actions access*, add `seazn.club.placement` with the role *Write*.
@@ -281,6 +281,34 @@ window — proto3 makes added fields safe in both directions, but a **renumbered
 or repurposed field number is not**, and no runbook step can save you from one.
 
 ## 5. Deploy
+
+### Before the FIRST production tag: the stg Auto-schedule check (O7) is a hard prerequisite
+
+Owner ruling. Do not push the first `v*.*.*` tag until every box below is ticked. Nothing in
+`prod.yml` enforces it (a tag deploys whatever image `ci` published for that commit), so this
+list is the gate. It is the same rehearsal the contract-change sequence in step 4b describes,
+made mandatory once: production has never run an image from this repository, and the first tag is
+the first time the whole chain (web app, Flycast, this service) is exercised on its own deploy
+path.
+
+- [ ] The commit you mean to tag is the tip of `main`, `ci` is green for it, and the `stg` run
+  for it is green: `placement-stg` runs that commit's published image.
+- [ ] `seazn-club-stg` really calls `placement-stg`, not production: `PLACEMENT_SERVICE_HOST` is
+  `placement-stg.flycast:50051` (step 4b).
+- [ ] Run one real Auto-schedule on `stg.seazn.club`, on a **multi-court** board. The result strip
+  reports the `optimized` engine, not the greedy fallback (step 7).
+- [ ] Attribute that solve by log: `placement-stg` shows exactly one `solve request=` line for it
+  and `placement` shows nothing for it.
+- [ ] Record the commit sha, the date and who ran the check in the tag's release notes.
+
+```bash
+fly secrets list --app seazn-club-stg | grep PLACEMENT_SERVICE_HOST
+fly logs --app placement-stg    # expect one `solve request=` line for the run
+fly logs --app placement        # the same run must add NOTHING here
+```
+
+Any box that cannot be ticked is a stop: fix it on `stg` first. Later tags follow the ordinary
+rehearsal window (step 4b, "Deploying a contract change").
 
 **Deploys run in CI, from the published image. Nothing rebuilds it.** On every
 push to `main`, `.github/workflows/ci.yml` builds the image once, smoke-tests it in
