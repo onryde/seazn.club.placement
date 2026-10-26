@@ -38,6 +38,7 @@ DESELECT_RE = re.compile(r"--deselect (tests/[\w/.]+\.py)::(\w+)")
 ALLOWED_ACTIONS = {
     "actions/checkout",
     "actions/setup-python",
+    "astral-sh/setup-uv",
     "actions/upload-artifact",
     "actions/download-artifact",
     "bufbuild/buf-action",
@@ -369,7 +370,11 @@ def test_no_expression_is_interpolated_into_a_run_block():
 def test_buf_is_pinned_once_with_its_checksum_and_both_users_take_it_from_env():
     code, jobs = _ci()
     env = _top_block(code, "env")
-    assert re.findall(r"^  (\w+):", env, re.MULTILINE) == ["BUF_VERSION", "BUF_SHA256_LINUX_X86_64"], env
+    # The two tools ci.yml installs from a pinned release, each a version and a checksum.
+    # (uv's half is held by tests/test_locked_install.py.)
+    assert re.findall(r"^  (\w+):", env, re.MULTILINE) == [
+        "BUF_VERSION", "BUF_SHA256_LINUX_X86_64", "UV_VERSION", "UV_SHA256_LINUX_X86_64",
+    ], env
     assert re.search(r'^  BUF_VERSION: "\d+\.\d+\.\d+"$', env, re.MULTILINE), env
     # sha256 of buf-Linux-x86_64 from that release's sha256.txt; buf-action
     # verifies the binary it installs against it. Bump the two together.

@@ -8,7 +8,8 @@
 #   <image>       what to publish, ghcr.io/onryde/seazn-placement:<commit sha>
 #
 # The publish job never rebuilds: a rebuild would resolve floating inputs again
-# (dependency ranges, the base image tag) and could push bytes nobody tested.
+# (the base image tag, the build backend pip fetches to build the package; the
+# dependencies are locked) and could push bytes nobody tested.
 #
 # The loaded image must say which repository it belongs to. GHCR reads the image's
 # org.opencontainers.image.source label to link a new package to its repository
