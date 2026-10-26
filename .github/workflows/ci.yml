@@ -48,6 +48,17 @@ env:
   # verifies the binary it installs against it, so a swapped release asset fails
   # the job instead of running. Change it together with BUF_VERSION.
   BUF_SHA256_LINUX_X86_64: "8f2986298ad08f0cc1bf999b9797b7c383adf32d7edf0f73d6f1e1a701baeac1"
+  # The ONE place uv's version is written in this file. The Dockerfile names the same
+  # release in `FROM ghcr.io/astral-sh/uv:<version>@sha256:...`, and
+  # tests/test_locked_install.py fails if the two differ. uv's only job here is to read
+  # uv.lock (`uv lock --check`, `uv export`); nothing in this repo resolves with it.
+  # Bump it to the newest uv release that is at least two weeks old:
+  #   gh release list -R astral-sh/uv --limit 5
+  # and move the Dockerfile's tag and digest with it.
+  UV_VERSION: "0.12.24"
+  # sha256 of that release's uv-x86_64-unknown-linux-gnu.tar.gz (its sha256.sum).
+  # setup-uv verifies the download against it. Change it together with UV_VERSION.
+  UV_SHA256_LINUX_X86_64: "b4dfaef47d491a7296981f8374a4595f55dbf84e8937c8ecd2983574d8bb3da6"
 
 jobs:
   # ---------------------------------------------------------------------
@@ -57,9 +68,9 @@ jobs:
   # manylinux cp314 wheels for x86_64). pyproject.toml's
   # `requires-python = ">=3.11"` is a floor, not a target: CI on 3.11 would
   # install cleanly and silently validate an interpreter nobody actually
-  # runs. grpcio itself resolves to 1.83.0 here (1.81.1, the version
+  # runs. grpcio itself is the 1.83.0 that uv.lock pins (1.81.1, the version
   # grpcio-tools and the generated stubs are pinned to, has no cp314
-  # wheel) - expected, and matches every dev machine.
+  # wheel) - expected.
   # ---------------------------------------------------------------------
   test:
     name: Test (pytest, Python 3.14)
@@ -82,16 +93,42 @@ jobs:
           version: ${{ env.BUF_VERSION }}
           checksum: ${{ env.BUF_SHA256_LINUX_X86_64 }}
 
-      - name: Install (editable, dev extras)
-        run: pip install -e ".[dev]"
+      # Everything installed here comes from uv.lock (pyproject.toml's ranges are
+      # never resolved), so a bad upstream release cannot reach this job, or the
+      # image, without a reviewed change to the lock. Three steps, none conditional,
+      # none allowed to fail (tests/test_locked_install.py pins that):
+      #   1. install uv, verified against UV_SHA256_LINUX_X86_64. enable-cache is
+      #      off: nothing here is worth a cache that another run could have written.
+      #   2. `uv lock --check` fails when pyproject.toml was edited without a
+      #      re-lock (run `uv lock` and commit uv.lock).
+      #   3. `uv export` writes the lock, dev extra included, as a requirements file
+      #      with a version and file hashes for every package, transitive ones too;
+      #      `pip install --require-hashes` takes nothing outside it; then this
+      #      package, editable, with --no-deps so pip resolves nothing.
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          checksum: ${{ env.UV_SHA256_LINUX_X86_64 }}
+          enable-cache: false
+
+      - name: uv.lock is current (uv lock --check)
+        run: uv lock --check
+
+      - name: Install the locked dependencies (dev extra), then this package
+        run: |
+          uv export --frozen --extra dev --no-emit-project --quiet --format requirements-txt \
+            --output-file "$RUNNER_TEMP/requirements.lock.txt"
+          pip install --require-hashes -r "$RUNNER_TEMP/requirements.lock.txt"
+          pip install --no-deps -e .
 
       # The pins here are an exact constraint intersection (ortools caps
       # protobuf<6.34; grpcio-testing is pinned to sit inside that), and
       # the generated grpc stub (scheduler_pb2_grpc.py) hard-embeds
-      # GRPC_GENERATED_VERSION and RAISES at import if the resolved grpcio
-      # runtime is older than what it was compiled against. A resolver
-      # that picks a satisfying-but-wrong combination has to fail the job
-      # here, loudly, not at first import in production.
+      # GRPC_GENERATED_VERSION and RAISES at import if the installed grpcio
+      # runtime is older than what it was compiled against. A lock whose
+      # combination does not satisfy this package's own requirements has to
+      # fail the job here, loudly, not at first import in production.
       - name: pip check (dependency conflict gate)
         run: pip check
 
@@ -159,8 +196,9 @@ jobs:
   # The image is built ONCE, here. The tar the build exports is what the smoke
   # steps run (after `docker load`) and, on main, what the publish job pushes:
   # the pushed bytes are the tested bytes. A second build in publish would
-  # resolve the floating inputs again (dependency ranges, the base image tag) and
-  # could ship something nobody tested.
+  # resolve the floating inputs again (the base image tag, the build backend pip
+  # fetches to build this package; the dependencies are locked) and could ship
+  # something nobody tested.
   # ---------------------------------------------------------------------
   docker:
     name: Docker build + image smoke test
@@ -204,8 +242,8 @@ jobs:
       # Import the committed stubs exactly as the running server does,
       # inside the actual built image - proving the generated code works
       # WITHOUT grpcio-tools, which the Dockerfile deliberately excludes
-      # from the runtime layer (`pip install .`, no `[dev]` extra: the
-      # codegen toolchain that produced these files has no business
+      # from the runtime layer (the lock is exported without the `dev` extra:
+      # the codegen toolchain that produced these files has no business
       # shipping in the image that just imports them).
       - name: Committed proto stubs import inside the image
         run: |
