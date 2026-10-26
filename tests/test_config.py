@@ -66,3 +66,77 @@ def test_settings_accepts_the_documented_defaults(monkeypatch):
     monkeypatch.setenv("PLACEMENT_SERVICE_SECRET", "test-secret")
     s = Settings.from_env()
     assert (s.port, s.max_workers, s.wall_seconds_max) == (50051, 4, 10.0)
+
+
+# --- PLACEMENT_BIND_HOST ----------------------------------------------------
+# The listen address is `<host>:<port>`. The default is the dual-stack wildcard
+# `[::]`, byte for byte what `build_server` used to hard-code: Fly's private
+# IPv6 network reaches the service through it, so a default that drifted to
+# `0.0.0.0` would take production off the network without a single test red.
+
+
+def _env_with_secret(monkeypatch):
+    monkeypatch.setenv("PLACEMENT_SERVICE_SECRET", "test-secret")
+
+
+def test_bind_host_defaults_to_the_dual_stack_wildcard(monkeypatch):
+    _env_with_secret(monkeypatch)
+    monkeypatch.delenv("PLACEMENT_BIND_HOST", raising=False)
+    s = Settings.from_env()
+    assert s.bind_host == "[::]"
+    assert s.listen_address == "[::]:50051"
+
+
+# (raw value, the host part of the listen address). Expected values are the
+# gRPC target grammar's, not the code's: an IPv6 literal is written in
+# brackets, a name or an IPv4 address is not.
+BIND_HOST_CASES = [
+    ("127.0.0.1", "127.0.0.1"),
+    ("0.0.0.0", "0.0.0.0"),
+    ("localhost", "localhost"),
+    ("::1", "[::1]"),  # a bare IPv6 literal gets its brackets
+    ("::", "[::]"),
+    ("fdaa:0:1::3", "[fdaa:0:1::3]"),
+    ("[::1]", "[::1]"),  # already bracketed: not bracketed twice
+    ("[::]", "[::]"),
+    ("  127.0.0.1\n", "127.0.0.1"),  # surrounding whitespace is not part of the host
+]
+
+
+@pytest.mark.parametrize("raw,expected", BIND_HOST_CASES)
+def test_bind_host_is_bracketed_only_when_it_is_a_bare_ipv6_literal(monkeypatch, raw, expected):
+    _env_with_secret(monkeypatch)
+    monkeypatch.setenv("PLACEMENT_BIND_HOST", raw)
+    monkeypatch.setenv("PLACEMENT_PORT", "6000")
+    s = Settings.from_env()
+    assert s.bind_host == expected
+    assert s.listen_address == f"{expected}:6000"
+
+
+def test_bind_host_cases_are_not_vacuous():
+    assert len(BIND_HOST_CASES) >= 8
+    assert any(raw.count(":") > 1 and "[" not in raw for raw, _ in BIND_HOST_CASES)
+
+
+@pytest.mark.parametrize("value", ["", " ", "   ", "\t", "\n"])
+def test_bind_host_refuses_an_empty_or_blank_value(monkeypatch, value):
+    """SET-but-blank is refused, and that is not the same as unset (unset takes
+    the default). Left to gRPC, a blank host builds the address `:50051`, which
+    grpcio 1.85 refuses at bind time with `host must not be empty` — a
+    RuntimeError that never names the env var, from a process whose operator
+    typed `PLACEMENT_BIND_HOST=` into a deploy file and expects loopback."""
+    _env_with_secret(monkeypatch)
+    monkeypatch.setenv("PLACEMENT_BIND_HOST", value)
+    with pytest.raises(ValueError, match="PLACEMENT_BIND_HOST"):
+        Settings.from_env()
+
+
+def test_bind_host_survives_dataclasses_replace(monkeypatch):
+    """The test suite builds `Settings` once and `replace()`s fields on it
+    (`port=0`), which re-runs the normalisation on an already-normalised host."""
+    import dataclasses  # noqa: PLC0415
+
+    _env_with_secret(monkeypatch)
+    monkeypatch.setenv("PLACEMENT_BIND_HOST", "::1")
+    s = dataclasses.replace(Settings.from_env(), port=0)
+    assert s.listen_address == "[::1]:0"

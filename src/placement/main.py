@@ -293,7 +293,7 @@ def build_server(settings: Settings) -> tuple[grpc.Server, int]:
     )
     scheduler_pb2_grpc.add_SchedulerServiceServicer_to_server(SchedulerServicer(settings), server)
     health_pb2_grpc.add_HealthServicer_to_server(build_health_servicer(), server)
-    port = server.add_insecure_port(f"[::]:{settings.port}")
+    port = server.add_insecure_port(settings.listen_address)
     return server, port
 
 
@@ -349,9 +349,14 @@ def serve() -> None:
     settings = Settings.from_env()
     server, port = build_server(settings)
     if port == 0:
-        raise RuntimeError(f"failed to bind port {settings.port}")
+        raise RuntimeError(f"failed to bind {settings.listen_address}")
     server.start()
-    log.info("service_listening", port=port, max_workers=settings.max_workers)
+    log.info(
+        "service_listening",
+        bind_host=settings.bind_host,
+        port=port,
+        max_workers=settings.max_workers,
+    )
     server.wait_for_termination()
 
 

@@ -54,6 +54,22 @@ npx vitest run src/__tests__/placement-integration.test.ts \
                src/__tests__/repair-decompose-cpsat-integration.test.ts
 ```
 
+### Bind address (`PLACEMENT_BIND_HOST`)
+
+The service listens on `<PLACEMENT_BIND_HOST>:<PLACEMENT_PORT>`. Unset, the host
+is `[::]`, the dual-stack wildcard the service has always bound and the one Fly's
+private IPv6 network reaches it through; leave it unset in `fly.toml`.
+
+On a laptop, `PLACEMENT_BIND_HOST=127.0.0.1` keeps the service off the LAN. It is
+then an IPv4-only listener, so a client that dials `::1` is refused.
+
+- A bare IPv6 literal is bracketed for you: `::1` and `[::1]` both bind `[::1]`.
+- Surrounding whitespace is ignored.
+- Set but empty or blank is refused at startup, naming the variable. It is not
+  read as unset.
+
+The listening log line carries the `bind_host` it bound.
+
 ### Stop it when you're done
 
 This is a plain foreground (or backgrounded) process on your machine, not a

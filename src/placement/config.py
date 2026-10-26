@@ -12,6 +12,36 @@ import os
 from dataclasses import dataclass
 
 
+#: What the service bound before `PLACEMENT_BIND_HOST` existed: the dual-stack
+#: wildcard. Fly's private IPv6 network (`placement.flycast`) reaches the
+#: machine through it, so this is a production contract, not a preference.
+DEFAULT_BIND_HOST = "[::]"
+
+
+def normalize_bind_host(raw: str) -> str:
+    """`PLACEMENT_BIND_HOST` -> the host part of a gRPC listen address.
+
+    A bare IPv6 literal (a colon, no bracket) gets its brackets, because
+    `::1:50051` is not a bracketless address in gRPC's target grammar: it is
+    parsed as a different, wrong IPv6 address and the bind fails far from the
+    cause. Everything else is passed through untouched, surrounding whitespace
+    aside.
+
+    A blank value is REFUSED rather than defaulted. Unset means "use
+    `DEFAULT_BIND_HOST`"; set-but-empty is a deploy-file typo whose author
+    expected some other host, and the default is the widest bind there is.
+    """
+    host = raw.strip()
+    if host == "":
+        raise ValueError(
+            f"PLACEMENT_BIND_HOST must not be empty or blank, got {raw!r}. Unset it to bind "
+            f"{DEFAULT_BIND_HOST!r}, or give an address such as 127.0.0.1."
+        )
+    if ":" in host and "[" not in host:
+        return f"[{host}]"
+    return host
+
+
 def _optional_int(name: str) -> int | None:
     """An env var that may be absent, parsed as an int.
 
@@ -49,6 +79,20 @@ class Settings:
     num_search_workers: int | None = None
     symmetry_level: int | None = None
     cp_model_probing_level: int | None = None
+
+    #: The host part of the listen address, in gRPC's target grammar (an IPv6
+    #: literal is bracketed). Normalised in `__post_init__`, so a `Settings`
+    #: built by hand and one built by `from_env()` agree.
+    bind_host: str = DEFAULT_BIND_HOST
+
+    def __post_init__(self) -> None:
+        # Frozen dataclass: the one sanctioned way to normalise a field in place.
+        # Idempotent, so `dataclasses.replace()` (which re-runs this) is safe.
+        object.__setattr__(self, "bind_host", normalize_bind_host(self.bind_host))
+
+    @property
+    def listen_address(self) -> str:
+        return f"{self.bind_host}:{self.port}"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -107,4 +151,7 @@ class Settings:
             num_search_workers=num_search_workers,
             symmetry_level=_optional_int("PLACEMENT_SYMMETRY_LEVEL"),
             cp_model_probing_level=_optional_int("PLACEMENT_PROBING_LEVEL"),
+            # `get(name, default)`, not `get(name) or default`: a set-but-empty
+            # value must reach `normalize_bind_host` and be refused.
+            bind_host=os.environ.get("PLACEMENT_BIND_HOST", DEFAULT_BIND_HOST),
         )
