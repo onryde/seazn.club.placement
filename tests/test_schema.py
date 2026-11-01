@@ -271,6 +271,68 @@ def test_round_barrier_refuses_a_value_outside_the_enum(where):
         request_to_model_input(req)
 
 
+# X-SW-31 rollout signal (review M4), the `person_only_fixture_accepted`
+# precedent: one line per request when an END barrier arrives beside a round,
+# so the stg rollout after the app starts sending it can be confirmed.
+
+
+def _end_barrier_request(fixture_barriers, pin_barriers, fixture_rounds=(1, 2, 1, 2)):
+    """Division 0 = fixtures 0-1, division 1 = fixtures 2-3; one pin, round 1."""
+    return _valid_request(
+        entrant_count=8,
+        division_count=2,
+        fixtures=[
+            scheduler_pb2.Fixture(
+                entrant_indices=[2 * k, 2 * k + 1], division_index=k // 2,
+                round_barrier=barrier,
+                **({} if rnd is None else {"round": rnd}),
+            )
+            for k, (barrier, rnd) in enumerate(zip(fixture_barriers, fixture_rounds))
+        ],
+        existing=[
+            scheduler_pb2.PinnedRow(
+                court_index=0, start_at_ms=SLOT_MS, round=1, round_barrier=barrier
+            )
+            for barrier in pin_barriers
+        ],
+    )
+
+
+def test_round_end_barrier_received_is_logged_with_its_counts():
+    """Division 0 "end", division 1 "start", one END pin: ONE line, counting
+    one END division (not two -- the start division is not an END one) and
+    one END pin. Counts only: no ids reach this service to log."""
+    req = _end_barrier_request(
+        [_RB.ROUND_BARRIER_END, _RB.ROUND_BARRIER_END, _RB.ROUND_BARRIER_START, 0],
+        [_RB.ROUND_BARRIER_END],
+    )
+    with structlog.testing.capture_logs() as captured:
+        request_to_model_input(req)
+    events = [e for e in captured if e["event"] == "round_end_barrier_received"]
+    assert len(events) == 1, captured
+    assert events[0]["request_id"] == "r1"
+    assert events[0]["end_divisions"] == 1
+    assert events[0]["end_pins"] == 1
+
+
+@pytest.mark.parametrize(
+    ("fixture_barriers", "pin_barriers", "fixture_rounds"),
+    [
+        ([0, 0, 0, 0], [0], (1, 2, 1, 2)),  # a pre-X-SW-31 request
+        ([_RB.ROUND_BARRIER_START] * 4, [_RB.ROUND_BARRIER_START], (1, 2, 1, 2)),
+        # END beside no round is read nowhere, so it is not a barrier either.
+        ([_RB.ROUND_BARRIER_END] * 4, [], (None, None, None, None)),
+    ],
+)
+def test_round_end_barrier_received_is_not_logged_without_an_end_barrier(
+    fixture_barriers, pin_barriers, fixture_rounds
+):
+    req = _end_barrier_request(fixture_barriers, pin_barriers, fixture_rounds)
+    with structlog.testing.capture_logs() as captured:
+        request_to_model_input(req)
+    assert [e for e in captured if e["event"] == "round_end_barrier_received"] == [], captured
+
+
 # --- degenerate scalars ----------------------------------------------------
 # Each of these is separately guarded downstream. They are rejected HERE so
 # the caller gets SOLVE_STATUS_ERROR with a reason, and so the domain never

@@ -311,6 +311,40 @@ def test_x_sw_31_two_sequences_are_independent():
     assert probe([0, 0, 0, 0]) is False
 
 
+def test_x_sw_31_a_start_division_beside_an_end_division_keeps_its_overlap():
+    """X-SW-31 two sequences are independent: a START division in the same
+    build as an END division is NOT barred (review I1). A joint build can
+    carry a Swiss division and a round-robin one side by side.
+
+    Division 0 = fixtures 0 (round 1), 1 (round 2), "end". Division 1 =
+    fixtures 2 (round 1), 3 (round 2), "start". Four courts. By hand:
+
+      * div 1: round 1 at T0, round 2 at T0+10 on a spare court. The start
+        floor allows it (T0 <= T0+10), and the end barrier would not
+        (T0+10 < T0+30). Feasible as built; refused once div 1 is "end" too,
+        so feasibility is the START reading's doing.
+      * div 0, same build: round 1 at T0, round 2 at T0+10 is refused, and
+        round 2 at T0+30 (start == end) is legal."""
+
+    def probe(barriers, forced):
+        model = build_model(
+            [([2 * k, 2 * k + 1], d) for k, d in enumerate([0, 0, 1, 1])],
+            4, _grid(4), STEP_MIN, _constraints(), [], [],
+            fixture_rounds=[1, 2, 1, 2], fixture_round_barriers=barriers,
+        )
+        for i, at in forced.items():
+            _force(model, i, _t(at))
+        return _feasible(model)
+
+    mixed = [END, END, START, START]
+    assert probe(mixed, {2: 0, 3: 10}) is True
+    assert probe([END] * 4, {2: 0, 3: 10}) is False
+    assert probe(mixed, {0: 0, 1: 10}) is False
+    assert probe(mixed, {0: 0, 1: 30}) is True
+    # Both at once: div 1 overlaps while div 0 holds its barrier.
+    assert probe(mixed, {0: 0, 1: 30, 2: 0, 3: 10}) is True
+
+
 # --- absent == start, byte for byte -------------------------------------------
 
 _BOARD = dict(
@@ -392,6 +426,25 @@ def test_x_sw_31_a_pin_whose_barrier_disagrees_with_its_sequence_is_refused():
         )
 
 
+def test_x_sw_31_an_end_pin_with_no_round_bearing_movable_is_inert():
+    """Review M2. With no round-bearing movable fixture there is no sequence
+    for an END pin to disagree with and nothing for it to bind, so it is
+    accepted and builds the absent model. The engine cannot send this shape
+    (`pinRoundOf` forwards a pin's round only beside one round-bearing free
+    sequence); this pins the tolerance, not a production path."""
+
+    def model_text(pin_barriers):
+        return str(
+            build_model(
+                [([0, 1], 0)], 2, _grid(2), STEP_MIN, _constraints(), [(0, _t(0))], [],
+                fixture_rounds=[None], existing_rounds=[1],
+                fixture_round_barriers=[START], existing_round_barriers=pin_barriers,
+            ).Proto()
+        )
+
+    assert model_text([END]) == model_text(None)
+
+
 def test_x_sw_31_a_barrier_outside_start_and_end_is_refused():
     with pytest.raises(ValueError, match="round barrier"):
         build_model(
@@ -403,10 +456,13 @@ def test_x_sw_31_a_barrier_outside_start_and_end_is_refused():
 # --- the counted parity sweep ---------------------------------------------------
 #
 # An independent checker, written from the contract and nothing else, run over
-# fixed-seed random boards. A start-floor division sits beside an "end" one on
-# some boards, so the checker also proves a start division is left alone by
-# never being asked about it. Pins appear only on single-division boards: the
-# caller forwards a pin's round only when there is one round sequence.
+# fixed-seed random boards. It checks the END divisions only: a start-floor
+# division sits beside an "end" one on some boards, but the checker never
+# inspects it, so this sweep cannot see a barrier leaking ONTO a start
+# division -- `test_x_sw_31_a_start_division_beside_an_end_division_keeps_its_
+# overlap` is what witnesses that. Pins appear only on single-division boards:
+# the caller forwards a pin's round only when there is one round sequence.
+# Solved on ONE search worker, so the counts are the same on every run.
 
 _PARITY_SEEDS = range(64)
 _PARITY_MIN_INSTANCES = 50
@@ -482,7 +538,10 @@ def _solve_instance(instance, with_barrier: bool):
         fixture_round_barriers=instance["barriers"] if with_barrier else None,
         existing_round_barriers=instance["existing_barriers"] if with_barrier else None,
     )
-    outcome = solve(model, wall_seconds=3.0)
+    # One worker is deterministic; the wall is set far above an idle solve
+    # (well under a second) so a loaded CI box does not cut a tier short and
+    # make the counts depend on the clock.
+    outcome = solve(model, wall_seconds=20.0, knobs=SolverKnobs(num_search_workers=1))
     assert outcome.status in ("OPTIMAL", "FEASIBLE"), outcome
     return outcome.assignments
 

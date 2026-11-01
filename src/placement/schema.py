@@ -763,6 +763,42 @@ def _log_person_only_fixtures(
         log.info("person_only_fixture_accepted", request_id=request_id, fixture_indices=indices)
 
 
+def _log_round_end_barrier(
+    request_id: str,
+    fixtures: list[tuple[list[int], int]],
+    rounds: list[int | None],
+    barriers: list[str],
+    pinned_round: list[int | None],
+    pinned_round_barriers: list[str],
+) -> None:
+    """X-SW-31 rollout signal (review M4), on `_log_person_only_fixtures`'s
+    precedent: one line per request whose END barrier arrives beside a round,
+    so the stg rollout after the app starts sending the field can be
+    CONFIRMED rather than assumed. A START or absent barrier, or an END beside
+    no round, is not a barrier and logs nothing. Counts only: this service
+    never sees an id to leak.
+
+    Logged on receipt, before `build_model` judges the board: a mixed
+    sequence still logs here and is then refused (`solve_rejected`)."""
+    end_divisions = {
+        division
+        for i, (_entrant_indices, division) in enumerate(fixtures)
+        if rounds[i] is not None and barriers[i] == ROUND_BARRIER_END
+    }
+    end_pins = sum(
+        1
+        for pin_round, barrier in zip(pinned_round, pinned_round_barriers)
+        if pin_round is not None and barrier == ROUND_BARRIER_END
+    )
+    if end_divisions or end_pins:
+        log.info(
+            "round_end_barrier_received",
+            request_id=request_id,
+            end_divisions=len(end_divisions),
+            end_pins=end_pins,
+        )
+
+
 def request_to_model_input(req) -> ModelInput:
     """Translate a `SolveBuildRequest` into domain types, or reject it.
 
@@ -843,6 +879,14 @@ def request_to_model_input(req) -> ModelInput:
         pinned_round,
         pinned_round_barriers,
     ) = _validated_existing(req.existing, num_courts, len(rule_groups), entrant_count)
+    _log_round_end_barrier(
+        req.request_id,
+        fixtures,
+        fixture_rounds,
+        fixture_round_barriers,
+        pinned_round,
+        pinned_round_barriers,
+    )
     dependencies = _validated_dependencies(req.dependencies, len(fixtures))
     constraints = _validated_constraints(req.constraints)
 

@@ -190,9 +190,10 @@ message PinnedRow {
   // unambiguous -- the model has no way to re-verify it.
   optional uint32 round = 5;
   // X-SW-31 -- the barrier of the sequence this pin's `round` is forwarded
-  // into; read only beside `round`, meaning as `Fixture.round_barrier`. An
-  // END pin floors a later round's start and caps an earlier round's end.
-  // Two pins are never ordered against each other.
+  // into; read only beside `round`, same meaning as `Fixture.round_barrier`.
+  // An END pin floors a later round's start and caps an earlier round's end.
+  // A pin's end is taken as `start_at_ms + match_minutes`, which is the end
+  // the app sends today. Two pins are never ordered against each other.
   RoundBarrier round_barrier = 6;
 }
 
