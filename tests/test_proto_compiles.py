@@ -154,6 +154,9 @@ EXPECTED_MESSAGE_FIELDS = {
         # X-SW-31 (W3 Swiss round end barrier). An enum, no presence:
         # UNSPECIFIED (0) is the absent value and reads as START.
         "round_barrier":   (6, FieldDescriptor.TYPE_ENUM,   False, False),
+        # Ruling 255 (W3 Swiss unpaired round slots). No presence: absent and
+        # false are the same bytes, the one "no flag" shape.
+        "unpaired_round_slot": (7, FieldDescriptor.TYPE_BOOL, False, False),
     },
     "PinnedRow": {
         "court_index":        (1, FieldDescriptor.TYPE_UINT32, False, True),

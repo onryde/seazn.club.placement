@@ -184,6 +184,16 @@ gives an empty required-tag list), and `_validated_fixtures` normalises that
 to `None` so `build_model` never has to know the wire convention -- and so an
 empty `set()` reaching it stays readable as the caller bug it would be,
 rather than as "every court".
+
+--- ruling 255: Fixture.unpaired_round_slot ---------------------------------
+
+A Swiss stage mints its later rounds as undrawn shells. `Fixture.unpaired_
+round_slot` admits such a board with both index lists empty -- the one
+exception to C10's "neither" refusal -- and refuses the flag beside any
+index. The flag stops at `_validated_fixtures`: an unpaired slot reaches
+`build_model` as two empty lists, which join no participant group, and
+`main.py`'s call is unchanged. An absent or false flag validates exactly as
+before.
 """
 
 from __future__ import annotations
@@ -416,7 +426,26 @@ def _validated_fixtures(
         # refusal survives for the case neither family can rescue: a fixture
         # that names no participant AT ALL joins no group either way, so the
         # measured hazard below still applies to it unchanged.
-        if len(f.entrant_indices) == 0 and len(f.person_indices) == 0:
+        #
+        # Ruling 255 (W3 Swiss) -- the one exception: an unpaired round slot,
+        # a board whose pairing is not drawn yet. Nobody is in it, so it
+        # joins no participant group BY DESIGN; courts, windows, day caps and
+        # the round order/barrier all reach it as they reach any fixture of
+        # its round (the barrier is what keeps a round's players apart). The flag is read in one
+        # place only, here: past this point an unpaired slot IS its two empty
+        # lists, so `build_model` needs no flag of its own. A slot that names
+        # a player is not unpaired -- accepting it would drop that player's
+        # clash and rest rules without a word -- so it is refused by name.
+        if f.unpaired_round_slot:
+            if len(f.entrant_indices) or len(f.person_indices):
+                raise InvalidRequestError(
+                    f"fixtures[{i}].unpaired_round_slot is set, but the fixture also names "
+                    f"entrant_indices={list(f.entrant_indices)!r} and person_indices="
+                    f"{list(f.person_indices)!r}. An unpaired round slot has no players yet and "
+                    "carries no person constraint, so both lists must be empty; a board with "
+                    "players is a drawn fixture and must not set the flag."
+                )
+        elif len(f.entrant_indices) == 0 and len(f.person_indices) == 0:
             raise InvalidRequestError(
                 f"fixtures[{i}] has neither entrant_indices nor person_indices set. A fixture "
                 "joining no participant group at all -- by entrant OR by person -- skips the "
@@ -763,6 +792,19 @@ def _log_person_only_fixtures(
         log.info("person_only_fixture_accepted", request_id=request_id, fixture_indices=indices)
 
 
+def _log_unpaired_round_slots(request_id: str, proto_fixtures) -> None:
+    """Ruling 255 rollout signal, on `_log_person_only_fixtures`'s and
+    `_log_round_end_barrier`'s precedent: one line per request that carries
+    an unpaired round slot, so the stg rollout after the app starts sending
+    the flag can be CONFIRMED rather than assumed. A count, not indices: a
+    Swiss stage sends every undrawn board of every later round, and one line
+    must stay one short line. Runs after `_validated_fixtures`, so every
+    counted slot was accepted."""
+    count = sum(1 for f in proto_fixtures if f.unpaired_round_slot)
+    if count:
+        log.info("unpaired_round_slot_accepted", request_id=request_id, unpaired_round_slots=count)
+
+
 def _log_round_end_barrier(
     request_id: str,
     fixtures: list[tuple[list[int], int]],
@@ -858,6 +900,7 @@ def request_to_model_input(req) -> ModelInput:
         fixture_round_barriers,
     ) = _validated_fixtures(req.fixtures, entrant_count, division_count, person_count, num_courts)
     _log_person_only_fixtures(req.request_id, fixtures, fixture_people)
+    _log_unpaired_round_slots(req.request_id, req.fixtures)
     # C1. Must run before `existing` below: `existing[].rule_group_indices`
     # resolves against `len(rule_groups)`.
     rule_groups = _validated_rule_groups(req.rule_groups, len(fixtures))

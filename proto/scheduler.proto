@@ -106,6 +106,13 @@ message Fixture {
   // later round's fixture does not start before an earlier round's fixture
   // ends (`start_j >= start_i + match_minutes`; equality is legal).
   RoundBarrier round_barrier = 6;
+  // Ruling 255 (W3 Swiss) -- an unpaired round slot: a board of a round whose
+  // pairing is not drawn yet. Unlike an undecided knockout slot (C10 above)
+  // it has no feeders, so it has no people either. When true, both
+  // `entrant_indices` and `person_indices` must be empty. The fixture takes a
+  // court and a time and carries no person constraint; every other
+  // constraint applies, `round_barrier` included.
+  bool unpaired_round_slot = 7;
 }
 
 // X-SW-31 (W3 Swiss) -- the round-order rule of one round sequence.
