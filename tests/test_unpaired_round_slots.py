@@ -373,6 +373,35 @@ def test_ruling_255_the_flag_with_indices_set_is_refused_by_name(server, names):
     assert list(response.assignments) == []
 
 
+def test_ruling_255_an_unpaired_slot_without_a_round_is_refused_by_name(server):
+    """Ruling 255 follow-up (controller, 2026-11-01): an unpaired slot must
+    carry `round`. With no round nothing orders it -- section 10 and the END
+    barrier read only round-bearing fixtures -- so it would float free of
+    the round it belongs to. Refused by name, at the schema and through the
+    RPC.
+
+    The positive pair, so a guard that refuses too much cannot pass:
+    `round = 0` is a real round (presence, not value: `round` is an opaque
+    ordering key and 0 is legal), and a DRAWN fixture without a round is
+    accepted exactly as before -- the rule is the flag's, not every
+    fixture's."""
+    roundless = pb.Fixture(division_index=0, round_barrier=END, unpaired_round_slot=True)
+    req = _request([_paired([0, 1], 1), roundless], 2, entrant_count=2)
+    with pytest.raises(InvalidRequestError, match=r"fixtures\[1\]\.unpaired_round_slot requires round"):
+        request_to_model_input(req)
+    response = _invoke(server, req)
+    assert response.status == pb.SOLVE_STATUS_ERROR
+    assert response.error.code == "INVALID_REQUEST"
+    assert "fixtures[1].unpaired_round_slot requires round" in response.error.message
+
+    round_zero = request_to_model_input(_request([_slot(0)], 1))
+    assert round_zero.fixture_rounds == [0]
+    drawn_roundless = request_to_model_input(
+        _request([pb.Fixture(entrant_indices=[0, 1], division_index=0)], 1, entrant_count=2)
+    )
+    assert drawn_roundless.fixture_rounds == [None]
+
+
 #: The refusal exactly as origin/main words it (27200db), copied from that
 #: source, not from this branch: "unchanged" means byte for byte.
 _NEITHER_REFUSAL = (

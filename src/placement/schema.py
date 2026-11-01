@@ -190,7 +190,7 @@ rather than as "every court".
 A Swiss stage mints its later rounds as undrawn shells. `Fixture.unpaired_
 round_slot` admits such a board with both index lists empty -- the one
 exception to C10's "neither" refusal -- and refuses the flag beside any
-index. The flag stops at `_validated_fixtures`: an unpaired slot reaches
+index or without a `round`. The flag stops at `_validated_fixtures`: an unpaired slot reaches
 `build_model` as two empty lists, which join no participant group, and
 `main.py`'s call is unchanged. An absent or false flag validates exactly as
 before.
@@ -444,6 +444,16 @@ def _validated_fixtures(
                     f"{list(f.person_indices)!r}. An unpaired round slot has no players yet and "
                     "carries no person constraint, so both lists must be empty; a board with "
                     "players is a drawn fixture and must not set the flag."
+                )
+            # Presence, not value: `round` is an opaque key and 0 is a real
+            # round. Without one nothing orders the slot -- the round order
+            # and the barrier read round-bearing fixtures only -- so it would
+            # float free of the round it belongs to.
+            if not f.HasField("round"):
+                raise InvalidRequestError(
+                    f"fixtures[{i}].unpaired_round_slot requires round. An unpaired slot has no "
+                    "players, so only its round orders it; without one the round order and the "
+                    "round barrier never reach it and it is placed anywhere."
                 )
         elif len(f.entrant_indices) == 0 and len(f.person_indices) == 0:
             raise InvalidRequestError(

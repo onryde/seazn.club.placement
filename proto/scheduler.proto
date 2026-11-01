@@ -109,9 +109,11 @@ message Fixture {
   // Ruling 255 (W3 Swiss) -- an unpaired round slot: a board of a round whose
   // pairing is not drawn yet. Unlike an undecided knockout slot (C10 above)
   // it has no feeders, so it has no people either. When true, both
-  // `entrant_indices` and `person_indices` must be empty. The fixture takes a
-  // court and a time and carries no person constraint; every other
-  // constraint applies, `round_barrier` included.
+  // `entrant_indices` and `person_indices` must be empty and `round` must be
+  // set. The fixture takes a court and a time and carries no person
+  // constraint; every other constraint applies, `round_barrier` included. No
+  // person rest applies to it, so any gap between rounds comes from
+  // `round_barrier` alone.
   bool unpaired_round_slot = 7;
 }
 
