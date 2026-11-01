@@ -191,6 +191,86 @@ def test_pinned_round_round_trips_alongside_existing():
     assert parsed.pinned_round == [3, None]
 
 
+# --- X-SW-31: the Swiss round end barrier ------------------------------------
+#
+# `round_barrier` is a proto3 enum, so it has no presence: UNSPECIFIED (0) is
+# what a caller that never sets it sends, and it must read exactly as START --
+# today's start floor. Decoded to the domain's two words, "start" | "end"
+# (the engine's own vocabulary, `solver-port.ts`'s `roundBarrier`), parallel to
+# `fixture_rounds`/`pinned_round` and kept off the bare tuples for the same
+# reason they are.
+
+_RB = scheduler_pb2.RoundBarrier
+
+
+def test_round_barrier_decodes_unspecified_and_start_as_start_and_end_as_end():
+    req = _valid_request(
+        entrant_count=6,
+        fixtures=[
+            scheduler_pb2.Fixture(entrant_indices=[0, 1], division_index=0, round=1),
+            scheduler_pb2.Fixture(
+                entrant_indices=[2, 3], division_index=0, round=1,
+                round_barrier=_RB.ROUND_BARRIER_START,
+            ),
+            scheduler_pb2.Fixture(
+                entrant_indices=[4, 5], division_index=0, round=2,
+                round_barrier=_RB.ROUND_BARRIER_END,
+            ),
+        ],
+        existing=[
+            scheduler_pb2.PinnedRow(court_index=0, start_at_ms=SLOT_MS, round=1),
+            scheduler_pb2.PinnedRow(
+                court_index=0, start_at_ms=SLOT_MS + 3_600_000, round=1,
+                round_barrier=_RB.ROUND_BARRIER_START,
+            ),
+            scheduler_pb2.PinnedRow(
+                court_index=0, start_at_ms=SLOT_MS + 7_200_000, round=2,
+                round_barrier=_RB.ROUND_BARRIER_END,
+            ),
+        ],
+    )
+    parsed = request_to_model_input(req)
+    assert parsed.fixture_round_barriers == ["start", "start", "end"]
+    assert parsed.pinned_round_barriers == ["start", "start", "end"]
+
+
+def test_round_barrier_absent_everywhere_decodes_as_start_everywhere():
+    """The empty case: a pre-X-SW-31 request. One entry per row, all "start"
+    -- never an empty list, which would leave the model reading positions that
+    do not exist."""
+    req = _valid_request(
+        existing=[scheduler_pb2.PinnedRow(court_index=0, start_at_ms=SLOT_MS)]
+    )
+    parsed = request_to_model_input(req)
+    assert parsed.fixture_round_barriers == ["start"]
+    assert parsed.pinned_round_barriers == ["start"]
+
+
+@pytest.mark.parametrize("where", ["fixtures", "existing"])
+def test_round_barrier_refuses_a_value_outside_the_enum(where):
+    """proto3 enums are open: an int the enum does not name arrives intact.
+    Reading it as either barrier would be a guess, so it is refused, the same
+    way the engine refuses a `roundBarrier` outside "start" | "end"."""
+    if where == "fixtures":
+        req = _valid_request(
+            fixtures=[
+                scheduler_pb2.Fixture(
+                    entrant_indices=[0, 1], division_index=0, round=1, round_barrier=7
+                )
+            ]
+        )
+    else:
+        req = _valid_request(
+            existing=[
+                scheduler_pb2.PinnedRow(
+                    court_index=0, start_at_ms=SLOT_MS, round=1, round_barrier=7
+                )
+            ]
+        )
+    with pytest.raises(InvalidRequestError, match=rf"{where}\[0\]\.round_barrier"):
+        request_to_model_input(req)
+
+
 # --- degenerate scalars ----------------------------------------------------
 # Each of these is separately guarded downstream. They are rejected HERE so
 # the caller gets SOLVE_STATUS_ERROR with a reason, and so the domain never

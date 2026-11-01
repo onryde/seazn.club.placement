@@ -151,6 +151,9 @@ EXPECTED_MESSAGE_FIELDS = {
         "person_indices":  (4, FieldDescriptor.TYPE_UINT32, True,  False),
         # #622 (round-scoped required court tags).
         "allowed_court_indices": (5, FieldDescriptor.TYPE_UINT32, True, False),
+        # X-SW-31 (W3 Swiss round end barrier). An enum, no presence:
+        # UNSPECIFIED (0) is the absent value and reads as START.
+        "round_barrier":   (6, FieldDescriptor.TYPE_ENUM,   False, False),
     },
     "PinnedRow": {
         "court_index":        (1, FieldDescriptor.TYPE_UINT32, False, True),
@@ -159,6 +162,8 @@ EXPECTED_MESSAGE_FIELDS = {
         "entrant_indices":    (4, FieldDescriptor.TYPE_UINT32, True,  False),
         # C1 (2026-08-12 round-ordering design).
         "round":              (5, FieldDescriptor.TYPE_UINT32, False, True),
+        # X-SW-31 (W3 Swiss round end barrier).
+        "round_barrier":      (6, FieldDescriptor.TYPE_ENUM,   False, False),
     },
     "RuleGroup": {
         "fixture_indices":      (1, FieldDescriptor.TYPE_UINT32, True,  False),
@@ -289,6 +294,25 @@ def test_solve_status_enum_contract():
     enum = pb2.SolveStatus.DESCRIPTOR
     actual = {value.name: value.number for value in enum.values}
     assert actual == EXPECTED_SOLVE_STATUS
+
+
+#: X-SW-31. 0 is the proto3 default, so it is the ABSENT value and must keep
+#: meaning START: a caller that never sets the field is today's start floor.
+EXPECTED_ROUND_BARRIER = {
+    "ROUND_BARRIER_UNSPECIFIED": 0,
+    "ROUND_BARRIER_START": 1,
+    "ROUND_BARRIER_END": 2,
+}
+
+
+def test_round_barrier_enum_contract():
+    pb2 = importlib.import_module("placement.generated.scheduler_pb2")
+    enum = pb2.RoundBarrier.DESCRIPTOR
+    actual = {value.name: value.number for value in enum.values}
+    assert actual == EXPECTED_ROUND_BARRIER
+    for message_name in ("Fixture", "PinnedRow"):
+        field = getattr(pb2, message_name).DESCRIPTOR.fields_by_name["round_barrier"]
+        assert field.enum_type is enum, f"{message_name}.round_barrier is not a RoundBarrier"
 
 
 if __name__ == "__main__":

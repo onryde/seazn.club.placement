@@ -387,6 +387,12 @@ log = structlog.get_logger(__name__)
 MIN_MS = 60_000
 DAY_MS = 86_400_000
 
+#: X-SW-31 (W3 Swiss) -- a round sequence's order, in the engine's own words
+#: (`solver-port.ts`'s `roundBarrier`). "start" is C1's start floor and what
+#: an absent barrier means; "end" adds the end barrier (section 10b).
+ROUND_BARRIER_START = "start"
+ROUND_BARRIER_END = "end"
+
 # Tier names are fixed protocol constants shared with the TS side (see the
 # design spec, "Tier/objective semantics are a fixed protocol constant") and
 # they live in `placement.objective`, with the chain that uses them — all of them in
@@ -545,6 +551,67 @@ def _day_of_pin(start_ms: int, day_bounds: dict[int, tuple[int, int]]) -> int | 
     return None
 
 
+def _round_barrier_at(barriers: list[str], k: int, where: str) -> str:
+    """X-SW-31: row `k`'s barrier, START when the list does not reach it (the
+    same tolerance every parallel list here gets), refused when it is neither
+    word -- reading an unknown value as either order would be a guess."""
+    barrier = barriers[k] if k < len(barriers) else ROUND_BARRIER_START
+    if barrier not in (ROUND_BARRIER_START, ROUND_BARRIER_END):
+        raise ValueError(
+            f"{where} round barrier must be {ROUND_BARRIER_START!r} or {ROUND_BARRIER_END!r}, "
+            f"got {barrier!r}."
+        )
+    return barrier
+
+
+def _end_barrier_scope(
+    fixtures: list[tuple[list[int], int]],
+    num_existing: int,
+    fixture_rounds: list[int | None],
+    existing_rounds: list[int | None],
+    fixture_round_barriers: list[str],
+    existing_round_barriers: list[str],
+) -> tuple[set[int], list[int]]:
+    """X-SW-31: the divisions that are END sequences, and the round-bearing
+    pins that carry END -- after refusing what the engine refuses
+    (`roundBarrierBySequence`, CONFIG_INVALID): a sequence ordered one way by
+    some rows and the other way by others is no rule anyone wrote.
+
+    A barrier beside no round is in no sequence and is skipped, exactly as the
+    engine skips a round-less row. A round-bearing pin has no division on the
+    wire, and section 10 pairs it with EVERY round-bearing movable fixture, so
+    its barrier must match every round-bearing division's; on a board the
+    engine builds there is only one (it forwards a pin's round only then).
+    """
+    barrier_by_division: dict[int, str] = {}
+    for i, (_entrant_indices, division) in enumerate(fixtures):
+        barrier = _round_barrier_at(fixture_round_barriers, i, f"fixture {i}")
+        if i >= len(fixture_rounds) or fixture_rounds[i] is None:
+            continue
+        seen = barrier_by_division.setdefault(division, barrier)
+        if seen != barrier:
+            raise ValueError(
+                f"division {division} mixes round barriers {seen!r} and {barrier!r} (fixture {i}). "
+                "A round sequence is ordered one way; the engine refuses this before asking."
+            )
+    division_barriers = set(barrier_by_division.values())
+    end_pins: list[int] = []
+    for k in range(num_existing):
+        barrier = _round_barrier_at(existing_round_barriers, k, f"existing row {k}")
+        if k >= len(existing_rounds) or existing_rounds[k] is None:
+            continue
+        if division_barriers and division_barriers != {barrier}:
+            raise ValueError(
+                f"existing row {k} carries round barrier {barrier!r}, which disagrees with the "
+                f"round-bearing fixtures' {sorted(division_barriers)!r}. A pin's round joins the "
+                "one round sequence on the board, so it is ordered the way that sequence is."
+            )
+        if barrier == ROUND_BARRIER_END:
+            end_pins.append(k)
+    end_divisions = {d for d, barrier in barrier_by_division.items() if barrier == ROUND_BARRIER_END}
+    return end_divisions, end_pins
+
+
 def _gap_lattice_ms(admissible_starts: list[int], dur_ms: int) -> int:
     """The coarsest unit every T2 idle gap is exactly a multiple of.
 
@@ -597,6 +664,8 @@ def build_model(
     existing_rounds: list[int | None] | None = None,
     person_indices: list[list[int]] | None = None,
     allowed_courts: list[set[int] | None] | None = None,
+    fixture_round_barriers: list[str] | None = None,
+    existing_round_barriers: list[str] | None = None,
 ) -> cp_model.CpModel:
     """Build the full constraint model. No objective is set — `solve()` owns
     that, so the tier chain (Prompt 03) can drive one model through several
@@ -690,6 +759,20 @@ def build_model(
             treats it as "no court", which is the only honest reading of the
             value and makes that bug loud (the fixture goes unplaced) rather
             than silently unconstrained.
+        fixture_round_barriers: X-SW-31 (W3 Swiss) — parallel to `fixtures`
+            the same way `fixture_rounds` is: `ROUND_BARRIER_START` or
+            `ROUND_BARRIER_END`, how `fixtures[i]`'s round sequence (its
+            division) is ordered. Read only beside a round, and one value per
+            division (a division whose round-bearing fixtures disagree is
+            refused). `None`, or a list shorter than `fixtures`, reads as
+            START: the board built before this parameter existed, byte for
+            byte. Section 10b is the only place an END is read.
+        existing_round_barriers: parallel to `existing` the same way — the
+            barrier of the sequence `existing[k]`'s round is forwarded into.
+            Read only beside `existing_rounds[k]`; it must agree with every
+            round-bearing division, because section 10 pairs a round-bearing
+            pin with every round-bearing movable fixture (the caller forwards
+            a pin's round only when there is ONE sequence).
     """
     del step_minutes  # see the docstring: contractual, not load-bearing.
     rule_groups = rule_groups or []
@@ -699,6 +782,16 @@ def build_model(
     allowed_courts = allowed_courts or []
     fixture_rounds = fixture_rounds or []
     existing_rounds = existing_rounds or []
+    # X-SW-31. Refused before anything is built, like the degenerate values
+    # below: every input the engine refuses, refused here too.
+    end_divisions, end_pins = _end_barrier_scope(
+        fixtures,
+        len(existing),
+        fixture_rounds,
+        existing_rounds,
+        fixture_round_barriers or [],
+        existing_round_barriers or [],
+    )
 
     # --- degenerate values that would otherwise produce a confidently WRONG
     # --- board reported as OPTIMAL. See "proto3 scalars are non-optional".
@@ -1202,6 +1295,43 @@ def build_model(
                         round_day[i], start[i], pin_day, existing_start, [placed[i]], f"{i}_pin{k}"
                     )
                 # ri == pin_round: never compared, same as the movable-movable tie.
+
+        # section 10b: the round END barrier (X-SW-31, W3 Swiss). Contract:
+        # `solver-port.ts`'s `roundBarrier`; verifier: `calendar.ts`'s
+        # `roundOrderConflicts`, kind `round_order_end`. In an END sequence
+        # (a division, `_end_barrier_scope`) every board of round j starts no
+        # earlier than every board of an earlier round i ENDS:
+        # `start_j >= start_i + dur_ms`. `>=`, because a start exactly at the
+        # end is legal. ON TOP of section 10's start floor, never instead of it.
+        #
+        # Same pair shape as section 10, minus the days: the full r < r' pair
+        # set, movable-movable scoped by division, pin-movable with the pin as
+        # a CONSTANT in both directions (an earlier-round pin floors the start,
+        # a later-round pin caps the end), pin-pin never visited. Unlike the
+        # start floor's day half this compares INSTANTS, so a pin off the
+        # lattice (`_day_of_pin` is None) still binds -- the verifier needs no
+        # zone for this rule either.
+        #
+        # A START or absent barrier reaches nothing below: `end_divisions` and
+        # `end_pins` are empty, and the model is the pre-X-SW-31 model, byte
+        # for byte.
+        for division in sorted(end_divisions):
+            rounds = [(i, fixture_rounds[i]) for i in by_division[division] if i in round_day]
+            for i, ri in rounds:
+                for j, rj in rounds:
+                    if ri < rj:
+                        model.Add(start[j] >= start[i] + dur_ms).OnlyEnforceIf([placed[i], placed[j]])
+        for k in end_pins:
+            pin_start = existing[k][1]
+            pin_round = existing_rounds[k]
+            # Every round-bearing movable fixture is in an END division here:
+            # `_end_barrier_scope` refused the board otherwise.
+            for i in round_day:
+                ri = fixture_rounds[i]
+                if pin_round < ri:
+                    model.Add(start[i] >= pin_start + dur_ms).OnlyEnforceIf(placed[i])
+                elif ri < pin_round:
+                    model.Add(start[i] + dur_ms <= pin_start).OnlyEnforceIf(placed[i])
 
     placed_sum = sum(placed)
     # The horizon `mk_lo`/`mk_hi` (and T2's gap vars) live on. It must cover
