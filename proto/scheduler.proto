@@ -41,11 +41,11 @@ message Fixture {
   // of a string.
   optional uint32 division_index = 2;
   // C1 (2026-08-12 round-ordering design) -- this fixture's 1-based position
-  // in ITS OWN round-robin sequence, not a global or cross-stage counter.
+  // in ITS OWN round sequence, not a global or cross-stage counter.
   // `optional`: round 0 would otherwise be indistinguishable from "no round",
-  // and MOST fixtures carry none at all -- bracket/stepladder/swiss fixtures
-  // are already ordered by `dependencies` (winner/loser feed edges) and never
-  // get one; only round-robin-generated fixtures do. Absent means
+  // and MOST fixtures carry none at all -- bracket/stepladder fixtures are
+  // already ordered by `dependencies` (winner/loser feed edges) and never get
+  // one; round-robin and Swiss fixtures do. Absent means
   // unconstrained by the round-order pair scan, not "round 0". The caller
   // (`build.ts`) is responsible for never sending round-bearing fixtures from
   // more than one round sequence in one division -- see
@@ -113,7 +113,9 @@ message Fixture {
   // set. The fixture takes a court and a time and carries no person
   // constraint; every other constraint applies, `round_barrier` included. No
   // person rest applies to it, so any gap between rounds comes from
-  // `round_barrier` alone.
+  // `round_barrier` alone. A Swiss caller sends END; a START or absent
+  // barrier is accepted, not refused, because a refusal would send the whole
+  // request to the greedy fallback.
   bool unpaired_round_slot = 7;
 }
 

@@ -77,6 +77,7 @@ from placement.model import (
 from placement.schema import (
     InvalidRequestError,
     error_response,
+    log_unpaired_round_slots_accepted,
     outcome_to_response,
     request_to_model_input,
 )
@@ -223,6 +224,10 @@ class SchedulerServicer(scheduler_pb2_grpc.SchedulerServiceServicer):
         except ValueError as exc:
             log.warning("solve_rejected", request_id=request.request_id, error=str(exc))
             return error_response("INVALID_REQUEST", str(exc))
+
+        # Ruling 255 rollout signal. Here, after every refusal path above, so
+        # "accepted" never names a request that was then refused (review M3).
+        log_unpaired_round_slots_accepted(request)
 
         # ONE LINE PER SOLVE, and it is not decoration.
         #

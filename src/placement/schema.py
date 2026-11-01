@@ -190,10 +190,12 @@ rather than as "every court".
 A Swiss stage mints its later rounds as undrawn shells. `Fixture.unpaired_
 round_slot` admits such a board with both index lists empty -- the one
 exception to C10's "neither" refusal -- and refuses the flag beside any
-index or without a `round`. The flag stops at `_validated_fixtures`: an unpaired slot reaches
-`build_model` as two empty lists, which join no participant group, and
-`main.py`'s call is unchanged. An absent or false flag validates exactly as
-before.
+index or without a `round`. The flag stops at `_validated_fixtures`: an
+unpaired slot reaches `build_model` as two empty lists, which join no
+participant group, and `main.py`'s `build_model` call is unchanged. The only
+other reader is `log_unpaired_round_slots_accepted`, which `main.py` calls
+once the request has been solved. An absent or false flag validates exactly
+as before.
 """
 
 from __future__ import annotations
@@ -802,17 +804,25 @@ def _log_person_only_fixtures(
         log.info("person_only_fixture_accepted", request_id=request_id, fixture_indices=indices)
 
 
-def _log_unpaired_round_slots(request_id: str, proto_fixtures) -> None:
+def log_unpaired_round_slots_accepted(req) -> None:
     """Ruling 255 rollout signal, on `_log_person_only_fixtures`'s and
     `_log_round_end_barrier`'s precedent: one line per request that carries
     an unpaired round slot, so the stg rollout after the app starts sending
     the flag can be CONFIRMED rather than assumed. A count, not indices: a
     Swiss stage sends every undrawn board of every later round, and one line
-    must stay one short line. Runs after `_validated_fixtures`, so every
-    counted slot was accepted."""
-    count = sum(1 for f in proto_fixtures if f.unpaired_round_slot)
+    must stay one short line.
+
+    "Accepted" means the WHOLE request was (review M3): `placement.main`
+    calls this only after `request_to_model_input`, `build_model` and
+    `solve` have all returned, so a request refused by any of them -- a bad
+    rule group, a mixed barrier -- never logs it. Lives here, not in
+    `main.py`, because this module is the one place a proto message is
+    read."""
+    count = sum(1 for f in req.fixtures if f.unpaired_round_slot)
     if count:
-        log.info("unpaired_round_slot_accepted", request_id=request_id, unpaired_round_slots=count)
+        log.info(
+            "unpaired_round_slot_accepted", request_id=req.request_id, unpaired_round_slots=count
+        )
 
 
 def _log_round_end_barrier(
@@ -910,7 +920,6 @@ def request_to_model_input(req) -> ModelInput:
         fixture_round_barriers,
     ) = _validated_fixtures(req.fixtures, entrant_count, division_count, person_count, num_courts)
     _log_person_only_fixtures(req.request_id, fixtures, fixture_people)
-    _log_unpaired_round_slots(req.request_id, req.fixtures)
     # C1. Must run before `existing` below: `existing[].rule_group_indices`
     # resolves against `len(rule_groups)`.
     rule_groups = _validated_rule_groups(req.rule_groups, len(fixtures))

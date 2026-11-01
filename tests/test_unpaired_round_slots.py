@@ -112,6 +112,7 @@ def _request(
     ticks: int = 18,
     slots=None,
     rule_groups=(),
+    existing=(),
 ) -> pb.SolveBuildRequest:
     return pb.SolveBuildRequest(
         request_id="r255",
@@ -124,7 +125,16 @@ def _request(
         step_minutes=STEP_MIN,
         constraints=pb.BuildConstraints(match_minutes=MATCH_MIN, gap_minutes=0),
         rule_groups=list(rule_groups),
+        existing=list(existing),
         wall_seconds=20.0,
+    )
+
+
+def _pin(court: int, at_minutes: int, round_: int, barrier=END) -> pb.PinnedRow:
+    """A played (or locked) board in `existing`, carrying its round the way
+    the app forwards a played round of the one sequence on the board."""
+    return pb.PinnedRow(
+        court_index=court, start_at_ms=_t(at_minutes), round=round_, round_barrier=barrier
     )
 
 
@@ -182,8 +192,19 @@ def _four_player_swiss(unpaired_round_2: bool) -> pb.SolveBuildRequest:
 # --- the empty case first -----------------------------------------------------
 
 
-def test_ruling_255_empty_case_first_no_flag_byte_identical_model():
-    """Ruling 255 empty case first: no flag -> byte-identical model.
+def test_ruling_255_empty_case_first_no_flag_is_one_wire_shape_and_builds_the_hand_model():
+    """Ruling 255 empty case first: no flag is ONE wire shape, and a no-flag
+    board parses to the hand tuples and builds exactly the model the domain
+    builds from them.
+
+    What this does NOT prove, named so nobody reads it in: that the no-flag
+    model is byte-identical to origin/main's. That comparison needs main's
+    module beside this one, so it ran out of suite -- a 400-request no-flag
+    corpus (drawn, person-only, "neither", duplicate, round/barrier/court-set
+    mixes) diffed line for line on origin/main 27200db and on this branch:
+    400/400 identical, 124 built (ModelInput and sha256 of the model text) and
+    276 refused (173 of them "neither", text included). Re-run at every
+    branch commit; the counts are in the commit bodies and the report.
 
     One "no flag" shape, not two: a proto3 `bool` has no presence, so a caller
     that never heard of the field and one that sends `false` put the SAME
@@ -196,11 +217,7 @@ def test_ruling_255_empty_case_first_no_flag_byte_identical_model():
     vacuous: that model holds two court lists AND four entrant groups (each
     player is in two boards), six NoOverlaps by hand; the unpaired twin holds
     the two court lists only (no player is in two boards), so the count can
-    move.
-
-    The branch's schema was also diffed against origin/main's on a
-    400-request corpus during the task (see the commit body); that needs a
-    historical copy of the module, so it cannot live here."""
+    move."""
     plain = pb.Fixture(entrant_indices=[0, 1], division_index=0, round=1)
     explicit_false = pb.Fixture(
         entrant_indices=[0, 1], division_index=0, round=1, unpaired_round_slot=False
@@ -340,6 +357,108 @@ def test_ruling_255_an_unpaired_slot_obeys_the_end_barrier_to_the_minute(barrier
     model = _model(req)
     _force(model, 0, T0)
     _force(model, 1, _t(slot_at))
+    assert _feasible(model) is feasible
+
+
+# --- the start floor and the pins (review I1) -----------------------------------
+#
+# Forced probes, each paired with a probe that differs only in the thing under
+# test, so a model that refuses everything cannot pass. Two courts throughout,
+# so a court clash is never the reason: the forced boards always leave one
+# court free.
+
+_NO_BARRIER = pb.ROUND_BARRIER_UNSPECIFIED
+
+
+@pytest.mark.parametrize("barrier", [START, _NO_BARRIER], ids=["start", "absent"])
+@pytest.mark.parametrize(
+    ("slot_at", "feasible"),
+    [
+        (0, False),   # 20 minutes before round 1's board starts
+        (20, True),   # the same tick: ties are legal under the start floor
+    ],
+    ids=["before-round-1-refused", "tie-legal"],
+)
+def test_ruling_255_the_start_floor_binds_an_unpaired_slot_under_start_or_no_barrier(
+    barrier, slot_at, feasible
+):
+    """Ruling 255: the round order still binds an unpaired slot when the
+    sequence is START or carries no barrier. By hand: the drawn round-1 board
+    is forced to T0+20. The start floor puts a round-2 board at or after
+    T0+20 on the same day; the shell at T0 (court 1 free) breaks it, the shell
+    at T0+20 (court 1) does not."""
+    req = _request(
+        [_paired([0, 1], 1, barrier=barrier), _slot(2, barrier=barrier)], 2, entrant_count=2
+    )
+    model = _model(req)
+    _force(model, 0, _t(20))
+    _force(model, 1, _t(slot_at))
+    assert _feasible(model) is feasible
+
+
+@pytest.mark.parametrize("barrier", [START, _NO_BARRIER], ids=["start", "absent"])
+@pytest.mark.parametrize(
+    ("slot_at", "feasible"),
+    [
+        (0, False),   # before the played round-1 board started
+        (20, True),   # the same tick, on the other court
+    ],
+    ids=["before-pin-refused", "tie-legal"],
+)
+def test_ruling_255_the_start_floor_binds_an_unpaired_slot_to_a_played_round_in_existing(
+    barrier, slot_at, feasible
+):
+    """Ruling 255, the production reschedule shape under START/absent: round
+    1 was played and arrives in `existing` with its round; round 2 is a shell.
+    By hand: the pin sits on court 0 at T0+20, on day 0. The start floor puts
+    the shell at or after T0+20; at T0 on court 1 (free, so no court clash)
+    it breaks that, at T0+20 on court 1 it does not."""
+    req = _request([_slot(2, barrier=barrier)], 2, existing=[_pin(0, 20, 1, barrier)])
+    model = _model(req)
+    _force(model, 0, _t(slot_at))
+    assert _feasible(model) is feasible
+
+
+@pytest.mark.parametrize(
+    ("barrier", "slot_at", "feasible"),
+    [
+        # The round-1 pin is on court 0 at T0 and ends T0+30.
+        (END, 20, False),    # ten minutes before the played board has ended
+        (END, 30, True),     # start == end: legal
+        (START, 20, True),   # the same probe under the start floor
+    ],
+    ids=["end-early-refused", "end-tie-legal", "start-early-legal"],
+)
+def test_ruling_255_the_end_barrier_binds_an_unpaired_slot_after_an_earlier_round_pin(
+    barrier, slot_at, feasible
+):
+    """Ruling 255: an earlier-round pin FLOORS a shell's start at the pin's
+    end. The shell can always use court 1."""
+    req = _request([_slot(2, barrier=barrier)], 2, existing=[_pin(0, 0, 1, barrier)])
+    model = _model(req)
+    _force(model, 0, _t(slot_at))
+    assert _feasible(model) is feasible
+
+
+@pytest.mark.parametrize(
+    ("barrier", "slot_at", "feasible"),
+    [
+        # The round-3 pin is on court 0 at T0+60. A round-2 shell must END by
+        # then, i.e. start by T0+30.
+        (END, 40, False),    # ends T0+70, after the round-3 board has started
+        (END, 30, True),     # ends T0+60 == the pin's start: legal
+        (START, 40, True),   # start floor only: T0+40 <= T0+60 on one day
+    ],
+    ids=["end-late-refused", "end-tie-legal", "start-late-legal"],
+)
+def test_ruling_255_the_end_barrier_binds_an_unpaired_slot_before_a_later_round_pin(
+    barrier, slot_at, feasible
+):
+    """Ruling 255: a later-round pin CAPS a shell's end at the pin's start.
+    The shell can always use court 1."""
+    req = _request([_slot(2, barrier=barrier)], 2, existing=[_pin(0, 60, 3, barrier)])
+    model = _model(req)
+    _force(model, 0, _t(slot_at))
     assert _feasible(model) is feasible
 
 
@@ -499,20 +618,57 @@ def test_ruling_255_the_court_set_still_binds_an_unpaired_slot(server, allowed, 
 # --- rollout signal -------------------------------------------------------------
 
 
-def test_ruling_255_accepted_slots_are_logged_once_per_request_with_a_count():
+def _accepted_lines(server, req) -> tuple[list[dict], pb.SolveBuildResponse]:
+    with structlog.testing.capture_logs() as captured:
+        response = _invoke(server, req)
+    return [e for e in captured if e["event"] == "unpaired_round_slot_accepted"], response
+
+
+def test_ruling_255_accepted_slots_are_logged_once_per_request_with_a_count(server):
     """On `person_only_fixture_accepted`'s and `round_end_barrier_received`'s
     precedent: one line per request, counts only, so the stg rollout can be
     confirmed rather than assumed. A request with no flag logs nothing."""
-    with structlog.testing.capture_logs() as captured:
-        request_to_model_input(_four_player_swiss(unpaired_round_2=True))
-    events = [e for e in captured if e["event"] == "unpaired_round_slot_accepted"]
-    assert len(events) == 1, captured
+    events, response = _accepted_lines(server, _four_player_swiss(unpaired_round_2=True))
+    assert response.status == pb.SOLVE_STATUS_OPTIMAL, response
+    assert len(events) == 1, events
     assert events[0]["request_id"] == "r255"
     assert events[0]["unpaired_round_slots"] == 2
 
-    with structlog.testing.capture_logs() as captured:
-        request_to_model_input(_four_player_swiss(unpaired_round_2=False))
-    assert [e for e in captured if e["event"] == "unpaired_round_slot_accepted"] == [], captured
+    events, response = _accepted_lines(server, _four_player_swiss(unpaired_round_2=False))
+    assert response.status == pb.SOLVE_STATUS_OPTIMAL, response
+    assert events == []
+
+
+def _refused_late_by_the_schema(req):
+    # A rule group naming fixture 99: refused by `_validated_rule_groups`,
+    # which runs AFTER the fixtures (and their flags) were read and accepted.
+    req.rule_groups.append(pb.RuleGroup(fixture_indices=[99]))
+    return req
+
+
+def _refused_by_the_model(req):
+    # One row of division 0 ordered START against the others' END: the schema
+    # accepts it and `build_model` refuses it ("mixes round barriers").
+    req.fixtures[0].round_barrier = START
+    return req
+
+
+@pytest.mark.parametrize(
+    ("refuse", "reason"),
+    [(_refused_late_by_the_schema, "rule_groups[0]"), (_refused_by_the_model, "mixes round barriers")],
+    ids=["schema-after-the-fixtures", "build-model"],
+)
+def test_ruling_255_a_request_refused_after_its_slots_were_read_logs_no_acceptance(
+    server, refuse, reason
+):
+    """Review M3: "accepted" means the whole request was -- the line is
+    emitted only after every validation has passed, the schema's AND
+    `build_model`'s, never on a request that is then refused."""
+    events, response = _accepted_lines(server, refuse(_four_player_swiss(unpaired_round_2=True)))
+    assert response.status == pb.SOLVE_STATUS_ERROR
+    assert response.error.code == "INVALID_REQUEST"
+    assert reason in response.error.message
+    assert events == []
 
 
 # --- the counted parity sweep ---------------------------------------------------
@@ -522,7 +678,8 @@ def test_ruling_255_accepted_slots_are_logged_once_per_request_with_a_count():
 # its first k rounds and unpaired after, per-court windows that open at
 # different ticks, and a random court set on some boards. Every placed board
 # is checked against its court's window, its court set, every other board on
-# its court, and -- in END divisions -- every board of every other round.
+# its court, and every board of every other round of its division: the start
+# floor in every division, the END rule in END divisions.
 # Solved through the real servicer on ONE search worker, so the counts are the
 # same on every run.
 
@@ -620,10 +777,17 @@ def _check(instance: dict, board: dict[int, tuple[int, int]]) -> dict:
                     breaches.append(("court", i, j))
             if fi["division"] != fj["division"] or fi["round"] == fj["round"]:
                 continue
-            if fi["barrier"] != END:
-                continue
             (a, sa), (b, sb) = ((i, si), (j, sj)) if fi["round"] < fj["round"] else ((j, sj), (i, si))
             unpaired = not fixtures[a]["entrants"] or not fixtures[b]["entrants"]
+            # The start floor binds in EVERY division, START or END (every
+            # board here is on day 0, so it is the plain `sb >= sa`).
+            out["floor_pairs"] += 1
+            out["unpaired_floor_pairs"] += unpaired
+            if sb < sa:
+                breaches.append(("floor", a, b, "unpaired" if unpaired else "drawn"))
+            if fi["barrier"] != END:
+                out["start_division_unpaired_floor_pairs"] += unpaired
+                continue
             out["end_pairs"] += 1
             out["unpaired_end_pairs"] += unpaired
             if sb < sa + DUR:
@@ -643,17 +807,20 @@ def _check(instance: dict, board: dict[int, tuple[int, int]]) -> dict:
 
 def test_ruling_255_counted_parity_sweep_unpaired_slots_satisfy_courts_windows_and_the_barrier(server):
     """Ruling 255 parity: over >= 30 fixed-seed Swiss boards, the solver's own
-    output satisfies courts, windows, court sets and the END barrier, checked
-    pair by pair by an independent checker.
+    output satisfies courts, windows, court sets, the start floor and the END
+    barrier, checked pair by pair by an independent checker; so does each
+    one-division board's START twin, for the start floor.
 
     Anti-vacuity, each counted and each failing at zero: instances checked
-    (>= 30), window checks, court pairs, END pairs with an unpaired side,
-    rounds whose unpaired slots ran side by side, and BITES -- one-division
+    (>= 30), window checks, court pairs, floor pairs with an unpaired side
+    (in START divisions too, and in the START twins), END pairs with an
+    unpaired side, rounds whose unpaired slots ran side by side, and BITES --
+    one-division
     boards whose barrier-free solve breaks the END rule on an unpaired pair,
     i.e. boards on which the barrier had something to do for an unpaired
     slot."""
     total = Counter()
-    instances = bites = 0
+    instances = bites = free_floor_pairs = 0
     for seed in _SWEEP_SEEDS:
         instance = _sweep_instance(seed)
         statuses = (pb.SOLVE_STATUS_OPTIMAL, pb.SOLVE_STATUS_FEASIBLE)
@@ -669,9 +836,20 @@ def test_ruling_255_counted_parity_sweep_unpaired_slots_satisfy_courts_windows_a
             # tier chain runs into the 20 s wall on one worker.
             free = _check(instance, _solve(server, _sweep_request(instance, START), statuses))
             bites += any(b[0] == "end" and b[3] == "unpaired" for b in free["breaches"])
-    print(f"ruling 255 parity: instances={instances} bites={bites} {dict(total)}")
+            # The START twin still owes the start floor, shells included.
+            floor = [b for b in free["breaches"] if b[0] != "end"]
+            assert floor == [], f"seed {seed} (START twin): {floor}"
+            free_floor_pairs += free["counts"]["unpaired_floor_pairs"]
+    print(
+        f"ruling 255 parity: instances={instances} bites={bites} "
+        f"free_floor_pairs={free_floor_pairs} {dict(total)}"
+    )
     assert instances >= _SWEEP_MIN_INSTANCES, f"only {instances} instances checked"
-    for key in ("windows", "court_sets", "court_pairs", "end_pairs", "unpaired_end_pairs"):
+    for key in (
+        "windows", "court_sets", "court_pairs", "end_pairs", "unpaired_end_pairs",
+        "unpaired_floor_pairs", "start_division_unpaired_floor_pairs",
+    ):
         assert total[key] > 0, f"{key}: nothing checked"
+    assert free_floor_pairs > 0, "the START twin checked no unpaired floor pair"
     assert total["parallel_rounds"] > 0, "no round's unpaired slots ever ran side by side"
     assert bites > 0, "no board ever needed the barrier for an unpaired slot"
