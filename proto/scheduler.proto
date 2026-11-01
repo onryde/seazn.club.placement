@@ -101,6 +101,21 @@ message Fixture {
   // slot on is legal and inert -- `model.py` already keeps a fixture off a
   // slotless court independently (section 1b).
   repeated uint32 allowed_court_indices = 5;
+  // X-SW-31 (W3 Swiss) -- how this fixture's round sequence (its division)
+  // is ordered. Read only beside `round`, and one value per division. END: a
+  // later round's fixture does not start before an earlier round's fixture
+  // ends (`start_j >= start_i + match_minutes`; equality is legal).
+  RoundBarrier round_barrier = 6;
+}
+
+// X-SW-31 (W3 Swiss) -- the round-order rule of one round sequence.
+enum RoundBarrier {
+  // Absent. Read as START.
+  ROUND_BARRIER_UNSPECIFIED = 0;
+  // C1's start floor: a later round does not start before an earlier one.
+  ROUND_BARRIER_START = 1;
+  // START, plus: a later round does not start before an earlier one ends.
+  ROUND_BARRIER_END = 2;
 }
 
 message Slot {
@@ -174,6 +189,12 @@ message PinnedRow {
   // that division match against the movable round-robin sequence is
   // unambiguous -- the model has no way to re-verify it.
   optional uint32 round = 5;
+  // X-SW-31 -- the barrier of the sequence this pin's `round` is forwarded
+  // into; read only beside `round`, same meaning as `Fixture.round_barrier`.
+  // An END pin floors a later round's start and caps an earlier round's end.
+  // A pin's end is taken as `start_at_ms + match_minutes`, which is the end
+  // the app sends today. Two pins are never ordered against each other.
+  RoundBarrier round_barrier = 6;
 }
 
 // C1 -- a rule and the exact set of fixtures it binds.

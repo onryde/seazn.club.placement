@@ -194,7 +194,7 @@ import structlog
 from google.protobuf import unknown_fields
 
 from placement.generated import scheduler_pb2
-from placement.model import SolveOutcome
+from placement.model import ROUND_BARRIER_END, ROUND_BARRIER_START, SolveOutcome
 from placement.objective import MIN_TIER_SECONDS
 
 log = structlog.get_logger(__name__)
@@ -309,6 +309,39 @@ class ModelInput:
     # a singular one. Normalised to `None` at parse time so `build_model` can
     # test one thing (`is None`) and never has to know the wire convention.
     allowed_courts: list[set[int] | None]
+    # X-SW-31 (W3 Swiss round end barrier) -- parallel to `fixtures` and to
+    # `existing` respectively, kept off both tuples for the reason
+    # `fixture_rounds`/`pinned_round` are. "start" | "end", decoded by
+    # `_round_barrier_of`: the wire's UNSPECIFIED (absent) and START both
+    # arrive as "start", so a caller that never sets the field builds exactly
+    # the model it built before the field existed.
+    fixture_round_barriers: list[str]
+    pinned_round_barriers: list[str]
+
+
+#: X-SW-31. The wire's three values onto the domain's two words. UNSPECIFIED
+#: is the proto3 default, i.e. ABSENT, and absent means the start floor
+#: (`solver-port.ts`'s `roundBarrier` contract).
+_ROUND_BARRIER_BY_WIRE = {
+    scheduler_pb2.ROUND_BARRIER_UNSPECIFIED: ROUND_BARRIER_START,
+    scheduler_pb2.ROUND_BARRIER_START: ROUND_BARRIER_START,
+    scheduler_pb2.ROUND_BARRIER_END: ROUND_BARRIER_END,
+}
+
+
+def _round_barrier_of(value: int, where: str) -> str:
+    """X-SW-31: one row's `round_barrier`, decoded. proto3 enums are OPEN, so
+    an int the enum does not name arrives intact rather than failing to parse;
+    reading it as either barrier would be a guess, so it is refused -- the
+    engine refuses a `roundBarrier` outside its two values the same way."""
+    barrier = _ROUND_BARRIER_BY_WIRE.get(value)
+    if barrier is None:
+        raise InvalidRequestError(
+            f"{where} must be a RoundBarrier value, got {value!r}. An unknown barrier cannot be "
+            "read as either the start floor or the end barrier without guessing which order the "
+            "caller meant."
+        )
+    return barrier
 
 
 def _require_index_present(has_field: bool, where: str) -> None:
@@ -348,7 +381,11 @@ def _require_index_range(value: int, bound: int, where: str) -> int:
 def _validated_fixtures(
     proto_fixtures, entrant_count: int, division_count: int, person_count: int, num_courts: int
 ) -> tuple[
-    list[tuple[list[int], int]], list[int | None], list[list[int]], list[set[int] | None]
+    list[tuple[list[int], int]],
+    list[int | None],
+    list[list[int]],
+    list[set[int] | None],
+    list[str],
 ]:
     """The movable fixtures, with every index they carry checked for range,
     plus their C1 round numbers and C10 person indices as SEPARATE parallel
@@ -367,6 +404,7 @@ def _validated_fixtures(
     fixture_rounds: list[int | None] = []
     fixture_people: list[list[int]] = []
     fixture_allowed_courts: list[set[int] | None] = []
+    fixture_round_barriers: list[str] = []
     for i, f in enumerate(proto_fixtures):
         # C10 (2026-08-16, wire person indices design) -- narrowed from "must
         # not be empty" to "neither entrants nor people": a genuinely
@@ -447,7 +485,12 @@ def _validated_fixtures(
         # Empty on the wire == unconstrained, normalised to `None` here. See
         # `ModelInput.allowed_courts`.
         fixture_allowed_courts.append(allowed_courts if allowed_courts else None)
-    return fixtures, fixture_rounds, fixture_people, fixture_allowed_courts
+        # X-SW-31 -- decoded for every row, round or not: the model reads it
+        # only beside a round, the same way the engine skips a round-less row.
+        fixture_round_barriers.append(
+            _round_barrier_of(f.round_barrier, f"fixtures[{i}].round_barrier")
+        )
+    return fixtures, fixture_rounds, fixture_people, fixture_allowed_courts, fixture_round_barriers
 
 
 def _validated_rule_groups(
@@ -529,8 +572,10 @@ def _validated_slots(proto_slots, num_courts: int) -> list[tuple[int, int, int]]
 
 def _validated_existing(
     rows, num_courts: int, num_rule_groups: int, entrant_count: int
-) -> tuple[list[tuple[int, int]], list[list[int]], list[list[int]], list[int | None]]:
-    """`existing`, plus its three C4/C6/C1 companions -- kept as SEPARATE
+) -> tuple[
+    list[tuple[int, int]], list[list[int]], list[list[int]], list[int | None], list[str]
+]:
+    """`existing`, plus its four C4/C6/C1/X-SW-31 companions -- kept as SEPARATE
     parallel lists (same length and order as the returned `existing`) rather
     than widened onto its `(court_index, start_at_ms)` tuple. `existing` is
     `build_model`'s argument, UNCHANGED, and `model.py` unpacks it as a bare
@@ -541,6 +586,7 @@ def _validated_existing(
     rule_group_indices_by_row: list[list[int]] = []
     entrant_indices_by_row: list[list[int]] = []
     round_by_row: list[int | None] = []
+    round_barrier_by_row: list[str] = []
     for i, a in enumerate(rows):
         _require_index_present(a.HasField("court_index"), f"existing[{i}].court_index")
         court_index = _require_index_range(a.court_index, num_courts, f"existing[{i}].court_index")
@@ -575,7 +621,11 @@ def _validated_existing(
         # common case). No range check: same reasoning as `Fixture.round` in
         # `_validated_fixtures` -- not a position into anything declared.
         round_by_row.append(a.round if a.HasField("round") else None)
-    return out, rule_group_indices_by_row, entrant_indices_by_row, round_by_row
+        # X-SW-31 -- the barrier of the sequence this pin's round joins.
+        round_barrier_by_row.append(
+            _round_barrier_of(a.round_barrier, f"existing[{i}].round_barrier")
+        )
+    return out, rule_group_indices_by_row, entrant_indices_by_row, round_by_row, round_barrier_by_row
 
 
 def _validated_dependencies(pairs, num_fixtures: int) -> list[tuple[int, int]]:
@@ -713,6 +763,42 @@ def _log_person_only_fixtures(
         log.info("person_only_fixture_accepted", request_id=request_id, fixture_indices=indices)
 
 
+def _log_round_end_barrier(
+    request_id: str,
+    fixtures: list[tuple[list[int], int]],
+    rounds: list[int | None],
+    barriers: list[str],
+    pinned_round: list[int | None],
+    pinned_round_barriers: list[str],
+) -> None:
+    """X-SW-31 rollout signal (review M4), on `_log_person_only_fixtures`'s
+    precedent: one line per request whose END barrier arrives beside a round,
+    so the stg rollout after the app starts sending the field can be
+    CONFIRMED rather than assumed. A START or absent barrier, or an END beside
+    no round, is not a barrier and logs nothing. Counts only: this service
+    never sees an id to leak.
+
+    Logged on receipt, before `build_model` judges the board: a mixed
+    sequence still logs here and is then refused (`solve_rejected`)."""
+    end_divisions = {
+        division
+        for i, (_entrant_indices, division) in enumerate(fixtures)
+        if rounds[i] is not None and barriers[i] == ROUND_BARRIER_END
+    }
+    end_pins = sum(
+        1
+        for pin_round, barrier in zip(pinned_round, pinned_round_barriers)
+        if pin_round is not None and barrier == ROUND_BARRIER_END
+    )
+    if end_divisions or end_pins:
+        log.info(
+            "round_end_barrier_received",
+            request_id=request_id,
+            end_divisions=len(end_divisions),
+            end_pins=end_pins,
+        )
+
+
 def request_to_model_input(req) -> ModelInput:
     """Translate a `SolveBuildRequest` into domain types, or reject it.
 
@@ -764,9 +850,13 @@ def request_to_model_input(req) -> ModelInput:
     division_count = req.division_count
     person_count = req.person_count
 
-    fixtures, fixture_rounds, fixture_people, fixture_allowed_courts = _validated_fixtures(
-        req.fixtures, entrant_count, division_count, person_count, num_courts
-    )
+    (
+        fixtures,
+        fixture_rounds,
+        fixture_people,
+        fixture_allowed_courts,
+        fixture_round_barriers,
+    ) = _validated_fixtures(req.fixtures, entrant_count, division_count, person_count, num_courts)
     _log_person_only_fixtures(req.request_id, fixtures, fixture_people)
     # C1. Must run before `existing` below: `existing[].rule_group_indices`
     # resolves against `len(rule_groups)`.
@@ -782,8 +872,20 @@ def request_to_model_input(req) -> ModelInput:
     # per-court blackout is placed correctly instead of the whole request
     # bouncing the caller back to its own greedy fallback. See that module's
     # docstring, "per-court grids" / "task C2".
-    existing, pinned_rule_group_indices, pinned_entrant_indices, pinned_round = _validated_existing(
-        req.existing, num_courts, len(rule_groups), entrant_count
+    (
+        existing,
+        pinned_rule_group_indices,
+        pinned_entrant_indices,
+        pinned_round,
+        pinned_round_barriers,
+    ) = _validated_existing(req.existing, num_courts, len(rule_groups), entrant_count)
+    _log_round_end_barrier(
+        req.request_id,
+        fixtures,
+        fixture_rounds,
+        fixture_round_barriers,
+        pinned_round,
+        pinned_round_barriers,
     )
     dependencies = _validated_dependencies(req.dependencies, len(fixtures))
     constraints = _validated_constraints(req.constraints)
@@ -811,6 +913,8 @@ def request_to_model_input(req) -> ModelInput:
         pinned_round=pinned_round,
         person_indices=fixture_people,
         allowed_courts=fixture_allowed_courts,
+        fixture_round_barriers=fixture_round_barriers,
+        pinned_round_barriers=pinned_round_barriers,
     )
 
 

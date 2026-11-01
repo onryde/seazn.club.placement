@@ -191,6 +191,99 @@ def test_round_order_survives_the_full_rpc_round_trip(test_server):
     )
 
 
+def _two_round_request(barrier) -> scheduler_pb2.SolveBuildRequest:
+    """X-SW-31. Round 2 listed first (index 0), round 1 second, disjoint
+    entrants, two courts, ten-minute ticks for two hours on one day."""
+    return _solvable_request(
+        court_names=["Court 1", "Court 2"],
+        entrant_count=4,
+        fixtures=[
+            scheduler_pb2.Fixture(
+                entrant_indices=[0, 1], division_index=0, round=2, round_barrier=barrier
+            ),
+            scheduler_pb2.Fixture(
+                entrant_indices=[2, 3], division_index=0, round=1, round_barrier=barrier
+            ),
+        ],
+        slots=[
+            scheduler_pb2.Slot(court_index=c, start_at_ms=SLOT_MS + k * 10 * 60_000, day_index=0)
+            for c in range(2)
+            for k in range(12)
+        ],
+        constraints=scheduler_pb2.BuildConstraints(match_minutes=30, gap_minutes=0),
+        wall_seconds=5.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("barrier", "round2_after_round1_minutes"),
+    [
+        # By hand: two 30-minute boards, two courts. Without the barrier the
+        # start floor allows a tie, and the span rung takes it: both at
+        # SLOT_MS (span 30). With END, round 2 may start no earlier than round
+        # 1 ends: SLOT_MS and SLOT_MS+30 (span 60, start == end).
+        (scheduler_pb2.ROUND_BARRIER_UNSPECIFIED, 0),
+        (scheduler_pb2.ROUND_BARRIER_START, 0),
+        (scheduler_pb2.ROUND_BARRIER_END, 30),
+    ],
+)
+def test_round_end_barrier_survives_the_full_rpc_round_trip(
+    test_server, barrier, round2_after_round1_minutes
+):
+    """X-SW-31 through the real servicer: schema decodes the field, `main.py`
+    hands it to the model, and the returned board obeys it."""
+    response, _, code, _ = _invoke(test_server, _two_round_request(barrier))
+    assert code == grpc.StatusCode.OK
+    assert response.status == scheduler_pb2.SOLVE_STATUS_OPTIMAL, response
+    start_by_fixture = {a.fixture_index: a.start_at_ms for a in response.assignments}
+    assert start_by_fixture == {
+        1: SLOT_MS,
+        0: SLOT_MS + round2_after_round1_minutes * 60_000,
+    }, list(response.assignments)
+
+
+@pytest.mark.parametrize(
+    ("barrier", "round2_at_minutes"),
+    [
+        # By hand: a played round-1 board pinned on Court 1 at SLOT_MS (ends
+        # +30). The round-2 movable takes the earliest start it may (the
+        # `day_start` rung). Start floor: >= the pin's START, Court 2 is free,
+        # so SLOT_MS. END: >= the pin's END, so SLOT_MS+30.
+        (scheduler_pb2.ROUND_BARRIER_UNSPECIFIED, 0),
+        (scheduler_pb2.ROUND_BARRIER_END, 30),
+    ],
+)
+def test_a_played_round_in_existing_floors_the_next_round_through_the_rpc(
+    test_server, barrier, round2_at_minutes
+):
+    """X-SW-31, the shape the app hands over: the played round rides in
+    `existing` with its round and barrier, the next round is movable."""
+    req = _two_round_request(barrier)
+    del req.fixtures[1]
+    req.existing.append(
+        scheduler_pb2.PinnedRow(court_index=0, start_at_ms=SLOT_MS, round=1, round_barrier=barrier)
+    )
+    response, _, code, _ = _invoke(test_server, req)
+    assert code == grpc.StatusCode.OK
+    assert response.status == scheduler_pb2.SOLVE_STATUS_OPTIMAL, response
+    assert [(a.fixture_index, a.start_at_ms) for a in response.assignments] == [
+        (0, SLOT_MS + round2_at_minutes * 60_000)
+    ]
+
+
+def test_a_mixed_round_barrier_comes_back_as_an_error_not_a_board(test_server):
+    """X-SW-31: a division ordered one way by one row and the other way by
+    another is refused by the model (the engine refuses it too); the caller
+    gets INVALID_REQUEST, not a board read one way or the other."""
+    req = _two_round_request(scheduler_pb2.ROUND_BARRIER_END)
+    req.fixtures[1].round_barrier = scheduler_pb2.ROUND_BARRIER_START
+    response, _, code, _ = _invoke(test_server, req)
+    assert code == grpc.StatusCode.OK
+    assert response.status == scheduler_pb2.SOLVE_STATUS_ERROR
+    assert response.error.code == "INVALID_REQUEST"
+    assert "mixes round barriers" in response.error.message
+
+
 def test_clamps_wall_seconds_to_the_server_ceiling(test_server, monkeypatch):
     """`wall_seconds` is caller-supplied. Without the clamp one request can pin
     a worker thread for as long as it likes."""
