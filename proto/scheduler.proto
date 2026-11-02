@@ -238,12 +238,16 @@ message PinnedRow {
   // Engine review I2 (W3 Swiss) -- the caller's calendar day of this pin, in
   // `Slot.day_index`'s index space (the org's local day, resolved by the
   // caller in the org's zone; a pin earlier on the same calendar day as the
-  // first slot gets that slot's day index). Read ONLY by
-  // `Fixture.rounds_per_day_cap`: when set, a round-bearing pin counts on this
-  // day. Absent, the pin counts on the day whose slot range its start falls
-  // in, or on none -- which is what a same-day rebuild's morning rounds did,
-  // since its slots start at "now". `optional`, because day 0 is a real day;
-  // a set value must be >= 0, like `Slot.day_index`.
+  // first slot gets that slot's day index). Read only where a pin is
+  // counted on a DAY: `Fixture.rounds_per_day_cap`,
+  // `RuleGroup.max_fixtures_per_day`, the round order's start floor (an
+  // earlier round never starts after a later one on the same day) and the
+  // per-day objective. When set, the pin counts on this day, whatever slot
+  // range its start falls in. Absent, the pin counts on the day whose slot
+  // range its start falls in, or on none -- which is what a same-day
+  // rebuild's morning pins did, since its slots start at "now". `optional`,
+  // because day 0 is a real day; a set value must be >= 0, like
+  // `Slot.day_index`.
   optional int32 day_index = 7;
 }
 

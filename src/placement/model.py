@@ -842,10 +842,11 @@ def build_model(
             list, or 0 is no cap.
         existing_day_indices: engine review I2 -- parallel to `existing`:
             `existing[k]`'s caller day (`PinnedRow.day_index`, in
-            `grid_slots`' day-index space), or `None` when unset. Read only
-            by section 10c: a set day is the day the pin counts on for the
-            rounds-per-day cap; `None` (or a short list) keeps the
-            slot-range bucketing (`_day_of_pin`), byte for byte.
+            `grid_slots`' day-index space), or `None` when unset. A set day
+            is the day the pin counts on wherever a pin is bucketed by day
+            (`pinned_day_by_row`: sections 9, 10, 10c and T1); `None` (or a
+            short list) keeps the slot-range bucketing (`_day_of_pin`), byte
+            for byte.
     """
     del step_minutes  # see the docstring: contractual, not load-bearing.
     rule_groups = rule_groups or []
@@ -1209,6 +1210,23 @@ def build_model(
                 "partition the admissible starts, or the per-day cap binds on the wrong fixtures."
             )
 
+    # Engine review I2 + follow-up 2 -- every pin's day, by ONE rule for every
+    # section that buckets pins by day: 9 (rule-group day caps), 10 (the
+    # start floor), 10c (rounds per day) and T1 (the per-day objective). The
+    # caller's day (`existing_day_indices`, `PinnedRow.day_index`) wins when
+    # set: a same-day rebuild's slots start at "now", so the morning's pins
+    # fall in no slot range and only the caller's day counts them. Unset, the
+    # slot range decides (`_day_of_pin`), byte for byte as before, and a pin
+    # in no range has no day (`None`) and counts against none. A set day the
+    # grid does not offer is kept as sent: no movable board can be on it, so
+    # the caps it feeds bind nothing, and T1 skips it (no variable to mark).
+    pinned_day_by_row: list[int | None] = []
+    for k, (_court, pin_start_ms) in enumerate(existing):
+        caller_day = existing_day_indices[k] if k < len(existing_day_indices) else None
+        pinned_day_by_row.append(
+            caller_day if caller_day is not None else _day_of_pin(pin_start_ms, day_bounds)
+        )
+
     # `on_day[i][d]==1 => lo_d <= start[i] <= hi_d`, plus
     # `sum_d on_day[i][d] == placed[i]`, pins down the true day
     # one-directionally: the solver cannot "cheat" by setting the wrong day's
@@ -1232,9 +1250,9 @@ def build_model(
         # both, so a not-yet-upgraded service still applied caps), is
         # retired; there is no second field left to prefer this over.
         #
-        # Bucket every PIN to the day its start falls on, once, before
+        # Bucket every PIN to its day (`pinned_day_by_row`: the caller's day
+        # when set, else the slot range its start falls in), once, before
         # walking groups — a pin's day does not depend on which group asks.
-        pinned_day_by_row = [_day_of_pin(start_ms, day_bounds) for _court, start_ms in existing]
         pinned_on_day_by_group: dict[int, dict[int, int]] = {}
         for k, group_indices in enumerate(pinned_rule_group_indices):
             if k >= len(pinned_day_by_row):
@@ -1364,7 +1382,7 @@ def build_model(
             pin_round = existing_rounds[k] if k < len(existing_rounds) else None
             if pin_round is None:
                 continue
-            pin_day = _day_of_pin(existing_start, day_bounds)
+            pin_day = pinned_day_by_row[k]
             if pin_day is None:
                 continue  # off-lattice: see _day_of_pin -- counts against nothing
             for i in range(n):
@@ -1462,12 +1480,7 @@ def build_model(
                 pin_round = existing_rounds[k] if k < len(existing_rounds) else None
                 if pin_round is None:
                     continue
-                caller_day = existing_day_indices[k] if k < len(existing_day_indices) else None
-                pin_day = (
-                    caller_day
-                    if caller_day is not None
-                    else _day_of_pin(existing_start, day_bounds)
-                )
+                pin_day = pinned_day_by_row[k]
                 if pin_day is None:
                     continue  # off-lattice: counts against nothing (see _day_of_pin)
                 pinned_rounds_by_day.setdefault(pin_day, set()).add(pin_round)
@@ -1643,13 +1656,23 @@ def build_model(
     # under a per-day objective an off-lattice pin is invisible to T1 entirely.
     # `tests/test_day_objective.py` pins that behaviour so a future reader
     # finds a decision.
-    for _court, existing_start in existing:
-        pin_day = _day_of_pin(existing_start, day_bounds)
-        if pin_day is None:
-            continue
+    #
+    # Follow-up 2: a pin with a caller day (`PinnedRow.day_index`) counts on
+    # that day even outside its slot range -- a same-day rebuild's morning.
+    # The day's variables cannot reach outside its window (their domains
+    # above), so such a pin's bounds are CLAMPED to it: a pin before the
+    # window opens the day at the window's open (offset 0), one after it
+    # closes ends the day at the window's last end. For a pin inside the
+    # window -- every pin the slot range buckets -- the clamp is the
+    # identity, so an unset day_index builds the same constraints as before.
+    for k, (_court, existing_start) in enumerate(existing):
+        pin_day = pinned_day_by_row[k]
+        if pin_day is None or pin_day not in day_used:
+            continue  # no day, or a caller day the grid does not offer
+        window_open, window_close = day_bounds[pin_day]
         model.Add(day_used[pin_day] == 1)
-        model.Add(day_lo[pin_day] <= existing_start)
-        model.Add(day_hi[pin_day] >= existing_start + dur_ms)
+        model.Add(day_lo[pin_day] <= max(existing_start, window_open))
+        model.Add(day_hi[pin_day] >= min(existing_start, window_close) + dur_ms)
 
     # `day_ids` is never empty — `grid_slots` is guarded non-empty above — so
     # all three are real linear expressions, not the bare `0` that `sum([])`

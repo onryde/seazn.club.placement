@@ -346,8 +346,8 @@ class ModelInput:
     fixture_round_gap_minutes: list[int]
     fixture_rounds_per_day_caps: list[int]
     # Engine review I2 -- parallel to `existing`: `existing[k]`'s caller day
-    # (`PinnedRow.day_index`), or `None` when unset. Read only by the
-    # rounds-per-day cap.
+    # (`PinnedRow.day_index`), or `None` when unset. Read wherever the model
+    # buckets a pin by day (day caps, rounds per day, round order, T1).
     pinned_day_index: list[int | None]
 
 

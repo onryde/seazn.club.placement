@@ -1162,13 +1162,17 @@ def test_ruling_256_the_cap_counts_distinct_rounds_of_drawn_or_unpaired_boards(
         (1, [(0, 180, 3)], [(2, 0)], True),
         (1, [(0, 180, 3, 0)], [(2, 0)], False),
         (1, [(0, 100, 3)], [(2, 0)], False),
+        # Review m-r1 (mutant D): a SET day_index beats the slot range. The
+        # same on-lattice pin (day 0's range) with day_index 1 counts on day 1,
+        # so day 0 holds round 2 alone: legal.
+        (1, [(0, 100, 3, 1)], [(2, 0)], True),
     ],
     ids=[
         "earlier-pin-same-day-refused", "earlier-pin-next-day-legal", "earlier-pin-cap-2-legal",
         "later-pin-same-day-refused", "later-pin-day-before-legal",
         "over-cap-pins-same-round-legal", "over-cap-pins-new-round-refused",
         "off-lattice-pin-no-day-index-uncounted", "off-lattice-pin-day-index-counted",
-        "on-lattice-pin-counted",
+        "on-lattice-pin-counted", "on-lattice-pin-set-day-index-beats-the-slot-range",
     ],
 )
 def test_ruling_256_pins_bind_the_cap_in_both_directions(cap, pins, shells, feasible):
@@ -1751,3 +1755,120 @@ def test_ruling_256_the_gap_is_ignored_not_refused_under_start_or_no_barrier(ser
     assert sorted(board) == list(range(8))
     assert [board[i][1] for i in range(4)] == [T0] * 4
     assert [board[i][1] for i in range(4, 8)] == [_t(30)] * 4
+
+
+# --- follow-up 2: PinnedRow.day_index for sections 9, 10 and T1 -------------------
+
+
+@pytest.mark.parametrize(
+    ("day_index", "board"),
+    [(0, {}), (None, {0: _t(240)})],
+    ids=["set-no-third-match-today", "absent-unchanged-third-match-at-12"],
+)
+def test_pinned_day_index_a_players_morning_pins_count_against_max_fixtures_per_day(
+    server, day_index, board
+):
+    """Follow-up 2, section 9, through the real servicer. A same-day rebuild
+    at 12:00 (day 0 offers 12:00-13:50 on two courts, no other day). Entrant 0
+    played twice this morning (pins at 08:00 and 08:30, both in rule group 0,
+    `max_fixtures_per_day` 2); one more match of entrant 0 is to place.
+
+      `day_index` 0: day 0 already holds entrant 0's two matches, so there is
+      no room for a third today: it stays unplaced.
+      absent (unchanged): the morning pins fall in no slot range and count on
+      no day, so the third match is placed at 12:00, day 0's first tick --
+      three in one day against a cap of 2."""
+    kw = {} if day_index is None else dict(day_index=day_index)
+    morning = [
+        pb.PinnedRow(
+            court_index=0, start_at_ms=_t(at), rule_group_indices=[0], entrant_indices=[0, 2], **kw
+        )
+        for at in (0, 30)
+    ]
+    req = _request(
+        [pb.Fixture(entrant_indices=[0, 1], division_index=0)],
+        2,
+        entrant_count=3,
+        slots=_slots(range(2), 36, first=24),
+        rule_groups=[pb.RuleGroup(fixture_indices=[0], max_fixtures_per_day=2)],
+        existing=morning,
+    )
+    placed = _solve(server, req)
+    assert {i: at for i, (_court, at) in placed.items()} == board
+
+
+@pytest.mark.parametrize(
+    ("round_", "day_index", "feasible"),
+    [(2, 0, False), (2, None, True), (4, 0, True)],
+    ids=["set-earlier-round-after-a-later-pin-refused", "absent-unchanged-legal", "set-later-round-legal"],
+)
+def test_pinned_day_index_a_morning_pin_binds_the_start_floor_on_its_day(round_, day_index, feasible):
+    """Follow-up 2, section 10 (the START barrier's start floor). A same-day
+    rebuild (`_REBUILD`: day 0 from 12:00); round 3 was played this morning
+    at 08:00. One START shell forced at 12:00 on day 0.
+
+      round 2, `day_index` 0: on the pin's own day an earlier round may not
+      start after it -- refused.
+      round 2, absent (unchanged): the pin falls in no slot range, so the
+      start floor never sees it -- legal.
+      round 4, `day_index` 0: a later round after the pin -- legal."""
+    kw = {} if day_index is None else dict(day_index=day_index)
+    req = _request(
+        [_slot(round_, barrier=START)], 2, slots=_REBUILD, existing=[_pin(0, 0, 3, barrier=START, **kw)]
+    )
+    model = _model(req)
+    _force(model, 0, _t(240))
+    assert _feasible(model) is feasible
+
+
+def _fixed_to_one(model, name: str) -> bool:
+    """Does the model state `name == 1` outright (unconditionally)?"""
+    proto = model.Proto()
+    found = [k for k, v in enumerate(proto.variables) if v.name == name]
+    if not found:
+        return False
+    (k,) = found
+    return any(
+        c.has_linear()
+        and list(c.linear.vars) == [k]
+        and list(c.linear.coeffs) == [1]
+        and list(c.linear.domain) == [1, 1]
+        and not c.enforcement_literal
+        for c in proto.constraints
+    )
+
+
+#: One court; day 0 offers 08:00-09:50, day 1 12:00-13:50.
+_T1_GRID = _slots([0], 12) + _slots([0], 36, first=24, day=1, base=T0 + DAY_MS)
+
+
+@pytest.mark.parametrize(
+    ("at", "day", "has_day"),
+    [(_DAY_1, 1, True), (600, 0, True), (2 * _DAY_1, 2, False)],
+    ids=["before-its-days-window", "after-its-days-window", "a-day-the-grid-does-not-offer"],
+)
+def test_pinned_day_index_a_pin_marks_its_day_used_for_the_objective(at, day, has_day):
+    """Follow-up 2, T1 (the per-day objective). One movable match, forced
+    at 08:00 on day 0, and one pin outside every day's slot range: 08:00 on
+    day 1 (before its 12:00 window), 18:00 on day 0 (after its 09:50 window),
+    or 08:00 on day 2 (a day the grid does not offer).
+
+      `day_index` set: the pin marks its day used (`day_used_<d> == 1`) when
+      the grid has that day, and the board stays FEASIBLE -- the pin's bounds
+      on the day's first start and last end are clamped to the day's window,
+      whose variables cannot reach outside it. A day the grid lacks has no
+      variable to mark and is skipped.
+      absent (unchanged): an off-lattice pin is invisible to T1."""
+    for day_index, marks in ((day, has_day), (None, False)):
+        kw = {} if day_index is None else dict(day_index=day_index)
+        req = _request(
+            [pb.Fixture(entrant_indices=[0, 1], division_index=0)],
+            1,
+            entrant_count=2,
+            slots=_T1_GRID,
+            existing=[pb.PinnedRow(court_index=0, start_at_ms=_t(at), **kw)],
+        )
+        model = _model(req)
+        assert _fixed_to_one(model, f"day_used_{day}") is marks, day_index
+        _force(model, 0, T0)
+        assert _feasible(model), day_index
