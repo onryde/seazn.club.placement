@@ -184,6 +184,28 @@ gives an empty required-tag list), and `_validated_fixtures` normalises that
 to `None` so `build_model` never has to know the wire convention -- and so an
 empty `set()` reaching it stays readable as the caller bug it would be,
 rather than as "every court".
+
+--- ruling 255: Fixture.unpaired_round_slot ---------------------------------
+
+A Swiss stage mints its later rounds as undrawn shells. `Fixture.unpaired_
+round_slot` admits such a board with both index lists empty -- the one
+exception to C10's "neither" refusal -- and refuses the flag beside any
+index or without a `round`. The flag stops at `_validated_fixtures`: an
+unpaired slot reaches `build_model` as two empty lists, which join no
+participant group, and `main.py`'s `build_model` call is unchanged. The only
+other reader is `log_unpaired_round_slots_accepted`, which `main.py` calls
+once the request has been solved. An absent or false flag validates exactly
+as before.
+
+--- ruling 256: Fixture.round_gap_minutes / Fixture.rounds_per_day_cap -------
+
+An unpaired slot has no people, so person rest and per-person day caps never
+reach it; ruling 256 keeps both as ROUND limits on the sequence. Both fields
+are plain `uint32`s (0 and absent are one shape, and both mean "none"), so
+there is nothing to range-check here: they are decoded for every row into two
+lists parallel to `fixtures` and passed to `build_model` BY NAME. The rules --
+one value per sequence, read only beside a round, the gap only under END --
+live in `placement.model`, beside the barrier's own, and are refused there.
 """
 
 from __future__ import annotations
@@ -317,6 +339,16 @@ class ModelInput:
     # the model it built before the field existed.
     fixture_round_barriers: list[str]
     pinned_round_barriers: list[str]
+    # Ruling 256 -- parallel to `fixtures`, kept off its tuple for the same
+    # reason: `fixtures[i]`'s `round_gap_minutes` and `rounds_per_day_cap`, 0
+    # when the wire left them unset. Fixture-only: a pin carries neither and
+    # takes its sequence's values in the model.
+    fixture_round_gap_minutes: list[int]
+    fixture_rounds_per_day_caps: list[int]
+    # Engine review I2 -- parallel to `existing`: `existing[k]`'s caller day
+    # (`PinnedRow.day_index`), or `None` when unset. Read wherever the model
+    # buckets a pin by day (day caps, rounds per day, round order, T1).
+    pinned_day_index: list[int | None]
 
 
 #: X-SW-31. The wire's three values onto the domain's two words. UNSPECIFIED
@@ -386,6 +418,8 @@ def _validated_fixtures(
     list[list[int]],
     list[set[int] | None],
     list[str],
+    list[int],
+    list[int],
 ]:
     """The movable fixtures, with every index they carry checked for range,
     plus their C1 round numbers and C10 person indices as SEPARATE parallel
@@ -405,6 +439,8 @@ def _validated_fixtures(
     fixture_people: list[list[int]] = []
     fixture_allowed_courts: list[set[int] | None] = []
     fixture_round_barriers: list[str] = []
+    fixture_round_gap_minutes: list[int] = []
+    fixture_rounds_per_day_caps: list[int] = []
     for i, f in enumerate(proto_fixtures):
         # C10 (2026-08-16, wire person indices design) -- narrowed from "must
         # not be empty" to "neither entrants nor people": a genuinely
@@ -416,7 +452,36 @@ def _validated_fixtures(
         # refusal survives for the case neither family can rescue: a fixture
         # that names no participant AT ALL joins no group either way, so the
         # measured hazard below still applies to it unchanged.
-        if len(f.entrant_indices) == 0 and len(f.person_indices) == 0:
+        #
+        # Ruling 255 (W3 Swiss) -- the one exception: an unpaired round slot,
+        # a board whose pairing is not drawn yet. Nobody is in it, so it
+        # joins no participant group BY DESIGN; courts, windows, day caps and
+        # the round order/barrier all reach it as they reach any fixture of
+        # its round (the barrier is what keeps a round's players apart). The flag is read in one
+        # place only, here: past this point an unpaired slot IS its two empty
+        # lists, so `build_model` needs no flag of its own. A slot that names
+        # a player is not unpaired -- accepting it would drop that player's
+        # clash and rest rules without a word -- so it is refused by name.
+        if f.unpaired_round_slot:
+            if len(f.entrant_indices) or len(f.person_indices):
+                raise InvalidRequestError(
+                    f"fixtures[{i}].unpaired_round_slot is set, but the fixture also names "
+                    f"entrant_indices={list(f.entrant_indices)!r} and person_indices="
+                    f"{list(f.person_indices)!r}. An unpaired round slot has no players yet and "
+                    "carries no person constraint, so both lists must be empty; a board with "
+                    "players is a drawn fixture and must not set the flag."
+                )
+            # Presence, not value: `round` is an opaque key and 0 is a real
+            # round. Without one nothing orders the slot -- the round order
+            # and the barrier read round-bearing fixtures only -- so it would
+            # float free of the round it belongs to.
+            if not f.HasField("round"):
+                raise InvalidRequestError(
+                    f"fixtures[{i}].unpaired_round_slot requires round. An unpaired slot has no "
+                    "players, so only its round orders it; without one the round order and the "
+                    "round barrier never reach it and it is placed anywhere."
+                )
+        elif len(f.entrant_indices) == 0 and len(f.person_indices) == 0:
             raise InvalidRequestError(
                 f"fixtures[{i}] has neither entrant_indices nor person_indices set. A fixture "
                 "joining no participant group at all -- by entrant OR by person -- skips the "
@@ -490,7 +555,19 @@ def _validated_fixtures(
         fixture_round_barriers.append(
             _round_barrier_of(f.round_barrier, f"fixtures[{i}].round_barrier")
         )
-    return fixtures, fixture_rounds, fixture_people, fixture_allowed_courts, fixture_round_barriers
+        # Ruling 256 -- decoded for every row like the barrier; the model
+        # reads them only beside a round.
+        fixture_round_gap_minutes.append(int(f.round_gap_minutes))
+        fixture_rounds_per_day_caps.append(int(f.rounds_per_day_cap))
+    return (
+        fixtures,
+        fixture_rounds,
+        fixture_people,
+        fixture_allowed_courts,
+        fixture_round_barriers,
+        fixture_round_gap_minutes,
+        fixture_rounds_per_day_caps,
+    )
 
 
 def _validated_rule_groups(
@@ -573,7 +650,12 @@ def _validated_slots(proto_slots, num_courts: int) -> list[tuple[int, int, int]]
 def _validated_existing(
     rows, num_courts: int, num_rule_groups: int, entrant_count: int
 ) -> tuple[
-    list[tuple[int, int]], list[list[int]], list[list[int]], list[int | None], list[str]
+    list[tuple[int, int]],
+    list[list[int]],
+    list[list[int]],
+    list[int | None],
+    list[str],
+    list[int | None],
 ]:
     """`existing`, plus its four C4/C6/C1/X-SW-31 companions -- kept as SEPARATE
     parallel lists (same length and order as the returned `existing`) rather
@@ -587,6 +669,7 @@ def _validated_existing(
     entrant_indices_by_row: list[list[int]] = []
     round_by_row: list[int | None] = []
     round_barrier_by_row: list[str] = []
+    day_index_by_row: list[int | None] = []
     for i, a in enumerate(rows):
         _require_index_present(a.HasField("court_index"), f"existing[{i}].court_index")
         court_index = _require_index_range(a.court_index, num_courts, f"existing[{i}].court_index")
@@ -625,7 +708,27 @@ def _validated_existing(
         round_barrier_by_row.append(
             _round_barrier_of(a.round_barrier, f"existing[{i}].round_barrier")
         )
-    return out, rule_group_indices_by_row, entrant_indices_by_row, round_by_row, round_barrier_by_row
+        # Engine review I2 -- the pin's caller day, or `None` when the wire
+        # left it unset (then the model buckets the pin by slot range, as
+        # before). Day 0 is a real day, hence presence; >= 0 like
+        # `Slot.day_index`. No range check against the grid's days: a day the
+        # grid does not offer holds no movable board, so the pin binds nothing.
+        if a.HasField("day_index"):
+            if a.day_index < 0:
+                raise InvalidRequestError(
+                    f"existing[{i}].day_index must be >= 0, got {a.day_index!r}."
+                )
+            day_index_by_row.append(a.day_index)
+        else:
+            day_index_by_row.append(None)
+    return (
+        out,
+        rule_group_indices_by_row,
+        entrant_indices_by_row,
+        round_by_row,
+        round_barrier_by_row,
+        day_index_by_row,
+    )
 
 
 def _validated_dependencies(pairs, num_fixtures: int) -> list[tuple[int, int]]:
@@ -763,6 +866,27 @@ def _log_person_only_fixtures(
         log.info("person_only_fixture_accepted", request_id=request_id, fixture_indices=indices)
 
 
+def log_unpaired_round_slots_accepted(req) -> None:
+    """Ruling 255 rollout signal, on `_log_person_only_fixtures`'s and
+    `_log_round_end_barrier`'s precedent: one line per request that carries
+    an unpaired round slot, so the stg rollout after the app starts sending
+    the flag can be CONFIRMED rather than assumed. A count, not indices: a
+    Swiss stage sends every undrawn board of every later round, and one line
+    must stay one short line.
+
+    "Accepted" means the WHOLE request was (review M3): `placement.main`
+    calls this only after `request_to_model_input`, `build_model` and
+    `solve` have all returned, so a request refused by any of them -- a bad
+    rule group, a mixed barrier -- never logs it. Lives here, not in
+    `main.py`, because this module is the one place a proto message is
+    read."""
+    count = sum(1 for f in req.fixtures if f.unpaired_round_slot)
+    if count:
+        log.info(
+            "unpaired_round_slot_accepted", request_id=req.request_id, unpaired_round_slots=count
+        )
+
+
 def _log_round_end_barrier(
     request_id: str,
     fixtures: list[tuple[list[int], int]],
@@ -856,6 +980,8 @@ def request_to_model_input(req) -> ModelInput:
         fixture_people,
         fixture_allowed_courts,
         fixture_round_barriers,
+        fixture_round_gap_minutes,
+        fixture_rounds_per_day_caps,
     ) = _validated_fixtures(req.fixtures, entrant_count, division_count, person_count, num_courts)
     _log_person_only_fixtures(req.request_id, fixtures, fixture_people)
     # C1. Must run before `existing` below: `existing[].rule_group_indices`
@@ -878,6 +1004,7 @@ def request_to_model_input(req) -> ModelInput:
         pinned_entrant_indices,
         pinned_round,
         pinned_round_barriers,
+        pinned_day_index,
     ) = _validated_existing(req.existing, num_courts, len(rule_groups), entrant_count)
     _log_round_end_barrier(
         req.request_id,
@@ -915,6 +1042,9 @@ def request_to_model_input(req) -> ModelInput:
         allowed_courts=fixture_allowed_courts,
         fixture_round_barriers=fixture_round_barriers,
         pinned_round_barriers=pinned_round_barriers,
+        fixture_round_gap_minutes=fixture_round_gap_minutes,
+        fixture_rounds_per_day_caps=fixture_rounds_per_day_caps,
+        pinned_day_index=pinned_day_index,
     )
 
 

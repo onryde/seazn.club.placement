@@ -77,6 +77,7 @@ from placement.model import (
 from placement.schema import (
     InvalidRequestError,
     error_response,
+    log_unpaired_round_slots_accepted,
     outcome_to_response,
     request_to_model_input,
 )
@@ -212,10 +213,14 @@ class SchedulerServicer(scheduler_pb2_grpc.SchedulerServiceServicer):
                 parsed.pinned_round,
                 parsed.person_indices,
                 parsed.allowed_courts,
-                # X-SW-31. By name: two parallel `list[str]`s side by side
-                # are exactly what a positional slip swaps without a type error.
+                # X-SW-31 and ruling 256. By name: two parallel `list[str]`s
+                # (and two `list[int]`s) side by side are exactly what a
+                # positional slip swaps without a type error.
                 fixture_round_barriers=parsed.fixture_round_barriers,
                 existing_round_barriers=parsed.pinned_round_barriers,
+                fixture_round_gap_minutes=parsed.fixture_round_gap_minutes,
+                fixture_rounds_per_day_caps=parsed.fixture_rounds_per_day_caps,
+                existing_day_indices=parsed.pinned_day_index,
             )
             solve_started = time.perf_counter()
             outcome = solve(model, wall_seconds=wall, knobs=self._knobs)
@@ -223,6 +228,10 @@ class SchedulerServicer(scheduler_pb2_grpc.SchedulerServiceServicer):
         except ValueError as exc:
             log.warning("solve_rejected", request_id=request.request_id, error=str(exc))
             return error_response("INVALID_REQUEST", str(exc))
+
+        # Ruling 255 rollout signal. Here, after every refusal path above, so
+        # "accepted" never names a request that was then refused (review M3).
+        log_unpaired_round_slots_accepted(request)
 
         # ONE LINE PER SOLVE, and it is not decoration.
         #

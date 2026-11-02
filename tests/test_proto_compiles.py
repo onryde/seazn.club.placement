@@ -154,6 +154,13 @@ EXPECTED_MESSAGE_FIELDS = {
         # X-SW-31 (W3 Swiss round end barrier). An enum, no presence:
         # UNSPECIFIED (0) is the absent value and reads as START.
         "round_barrier":   (6, FieldDescriptor.TYPE_ENUM,   False, False),
+        # Ruling 255 (W3 Swiss unpaired round slots). No presence: absent and
+        # false are the same bytes, the one "no flag" shape.
+        "unpaired_round_slot": (7, FieldDescriptor.TYPE_BOOL, False, False),
+        # Ruling 256 (W3 Swiss round limits). No presence: absent and 0 are the
+        # same bytes, and 0 means no gap / no cap.
+        "round_gap_minutes":  (8, FieldDescriptor.TYPE_UINT32, False, False),
+        "rounds_per_day_cap": (9, FieldDescriptor.TYPE_UINT32, False, False),
     },
     "PinnedRow": {
         "court_index":        (1, FieldDescriptor.TYPE_UINT32, False, True),
@@ -164,6 +171,9 @@ EXPECTED_MESSAGE_FIELDS = {
         "round":              (5, FieldDescriptor.TYPE_UINT32, False, True),
         # X-SW-31 (W3 Swiss round end barrier).
         "round_barrier":      (6, FieldDescriptor.TYPE_ENUM,   False, False),
+        # Engine review I2: the pin's caller day for rounds_per_day_cap. Presence
+        # tracked, like Slot.day_index: day 0 is a real day.
+        "day_index":          (7, FieldDescriptor.TYPE_INT32,  False, True),
     },
     "RuleGroup": {
         "fixture_indices":      (1, FieldDescriptor.TYPE_UINT32, True,  False),

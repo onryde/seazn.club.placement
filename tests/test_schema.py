@@ -1122,6 +1122,10 @@ EXEMPT_INDEX_FIELDS = {
     "PinnedRow.round": "an opaque ordering key in the caller's own round-robin sequence, not a position",
     # C10 (2026-08-16, wire person indices design).
     "SolveBuildRequest.person_count": "a declared bound for person_indices, not itself an index",
+    # Ruling 256 (W3 Swiss round limits). Neither points into a list: 0 means
+    # none, and any other `uint32` is a legitimate limit.
+    "Fixture.round_gap_minutes": "a duration in minutes between rounds, not a position",
+    "Fixture.rounds_per_day_cap": "a count of rounds per day, not a position",
 }
 
 
@@ -1165,6 +1169,8 @@ def test_the_index_policy_accounts_for_every_uint32_field_in_the_contract():
         "Fixture.round",
         "PinnedRow.round",
         "SolveBuildRequest.person_count",
+        "Fixture.round_gap_minutes",
+        "Fixture.rounds_per_day_cap",
     }
     assert set(INDEX_FIELDS).isdisjoint(EXEMPT_INDEX_FIELDS)
 

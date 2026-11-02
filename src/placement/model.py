@@ -612,6 +612,59 @@ def _end_barrier_scope(
     return end_divisions, end_pins
 
 
+#: Ruling 256's two per-sequence round limits, by their wire names.
+ROUND_GAP_MINUTES = "round_gap_minutes"
+ROUNDS_PER_DAY_CAP = "rounds_per_day_cap"
+
+
+def _round_limits_scope(
+    fixtures: list[tuple[list[int], int]],
+    fixture_rounds: list[int | None],
+    fixture_round_gap_minutes: list[int],
+    fixture_rounds_per_day_caps: list[int],
+) -> tuple[dict[int, int], dict[int, int]]:
+    """Ruling 256: each sequence's (division's) round gap in MINUTES and its
+    rounds-per-day cap, after refusing what the engine refuses: a sequence
+    whose round-bearing rows disagree on either value, which is no rule
+    anyone wrote. Scoped exactly as `_end_barrier_scope` scopes the barrier:
+    a value beside no round is in no sequence and is skipped, and a list
+    shorter than `fixtures` reads as 0, the tolerance every parallel list
+    here gets. Pins carry neither value on the wire; section 10b/10c bind
+    them with the sequence's.
+
+    A negative value is refused on EVERY row, round or not: the wire's
+    `uint32` cannot carry one, so only a direct caller can, and it is never a
+    rule (a negative gap lets round 2 start before round 1 ends; a negative
+    cap forbids every round on every day).
+
+    Only nonzero values are returned, so a board that sets neither gets two
+    empty dicts and the pre-256 model, byte for byte."""
+    by_name: dict[str, dict[int, int]] = {ROUND_GAP_MINUTES: {}, ROUNDS_PER_DAY_CAP: {}}
+    for i, (_entrant_indices, division) in enumerate(fixtures):
+        for name, values in (
+            (ROUND_GAP_MINUTES, fixture_round_gap_minutes),
+            (ROUNDS_PER_DAY_CAP, fixture_rounds_per_day_caps),
+        ):
+            value = int(values[i]) if i < len(values) else 0
+            if value < 0:
+                raise ValueError(
+                    f"fixture {i} {name} must be >= 0, got {value!r}. 0 means none; a "
+                    "negative value is no round limit anyone wrote."
+                )
+            if i >= len(fixture_rounds) or fixture_rounds[i] is None:
+                continue
+            seen = by_name[name].setdefault(division, value)
+            if seen != value:
+                raise ValueError(
+                    f"division {division} mixes {name} {seen!r} and {value!r} (fixture {i}). "
+                    "A round sequence has one value; the engine refuses this before asking."
+                )
+    return (
+        {d: v for d, v in by_name[ROUND_GAP_MINUTES].items() if v},
+        {d: v for d, v in by_name[ROUNDS_PER_DAY_CAP].items() if v},
+    )
+
+
 def _gap_lattice_ms(admissible_starts: list[int], dur_ms: int) -> int:
     """The coarsest unit every T2 idle gap is exactly a multiple of.
 
@@ -666,6 +719,9 @@ def build_model(
     allowed_courts: list[set[int] | None] | None = None,
     fixture_round_barriers: list[str] | None = None,
     existing_round_barriers: list[str] | None = None,
+    fixture_round_gap_minutes: list[int] | None = None,
+    fixture_rounds_per_day_caps: list[int] | None = None,
+    existing_day_indices: list[int | None] | None = None,
 ) -> cp_model.CpModel:
     """Build the full constraint model. No objective is set — `solve()` owns
     that, so the tier chain (Prompt 03) can drive one model through several
@@ -773,6 +829,24 @@ def build_model(
             round-bearing division, because section 10 pairs a round-bearing
             pin with every round-bearing movable fixture (the caller forwards
             a pin's round only when there is ONE sequence).
+        fixture_round_gap_minutes: ruling 256 -- parallel to `fixtures` the
+            same way: the round gap of `fixtures[i]`'s sequence, in minutes.
+            Read only beside a round, one value per division (see
+            `_round_limits_scope`), and only in an END division, by section
+            10b. `None`, a short list, or 0 is no gap: the board built before
+            this parameter existed, byte for byte.
+        fixture_rounds_per_day_caps: ruling 256 -- parallel to `fixtures` the
+            same way: the most distinct rounds of `fixtures[i]`'s sequence
+            that may have a board on one day. Read only beside a round, one
+            value per division, any barrier, by section 10c. `None`, a short
+            list, or 0 is no cap.
+        existing_day_indices: engine review I2 -- parallel to `existing`:
+            `existing[k]`'s caller day (`PinnedRow.day_index`, in
+            `grid_slots`' day-index space), or `None` when unset. A set day
+            is the day the pin counts on wherever a pin is bucketed by day
+            (`pinned_day_by_row`: sections 9, 10, 10c and T1); `None` (or a
+            short list) keeps the slot-range bucketing (`_day_of_pin`), byte
+            for byte.
     """
     del step_minutes  # see the docstring: contractual, not load-bearing.
     rule_groups = rule_groups or []
@@ -782,6 +856,7 @@ def build_model(
     allowed_courts = allowed_courts or []
     fixture_rounds = fixture_rounds or []
     existing_rounds = existing_rounds or []
+    existing_day_indices = existing_day_indices or []
     # X-SW-31. Refused before anything is built, like the degenerate values
     # below: every input the engine refuses, refused here too.
     end_divisions, end_pins = _end_barrier_scope(
@@ -791,6 +866,13 @@ def build_model(
         existing_rounds,
         fixture_round_barriers or [],
         existing_round_barriers or [],
+    )
+    # Ruling 256, refused at the same point for the same reason.
+    round_gap_by_division, rounds_per_day_cap = _round_limits_scope(
+        fixtures,
+        fixture_rounds,
+        fixture_round_gap_minutes or [],
+        fixture_rounds_per_day_caps or [],
     )
 
     # --- degenerate values that would otherwise produce a confidently WRONG
@@ -1128,6 +1210,23 @@ def build_model(
                 "partition the admissible starts, or the per-day cap binds on the wrong fixtures."
             )
 
+    # Engine review I2 + follow-up 2 -- every pin's day, by ONE rule for every
+    # section that buckets pins by day: 9 (rule-group day caps), 10 (the
+    # start floor), 10c (rounds per day) and T1 (the per-day objective). The
+    # caller's day (`existing_day_indices`, `PinnedRow.day_index`) wins when
+    # set: a same-day rebuild's slots start at "now", so the morning's pins
+    # fall in no slot range and only the caller's day counts them. Unset, the
+    # slot range decides (`_day_of_pin`), byte for byte as before, and a pin
+    # in no range has no day (`None`) and counts against none. A set day the
+    # grid does not offer is kept as sent: no movable board can be on it, so
+    # the caps it feeds bind nothing, and T1 skips it (no variable to mark).
+    pinned_day_by_row: list[int | None] = []
+    for k, (_court, pin_start_ms) in enumerate(existing):
+        caller_day = existing_day_indices[k] if k < len(existing_day_indices) else None
+        pinned_day_by_row.append(
+            caller_day if caller_day is not None else _day_of_pin(pin_start_ms, day_bounds)
+        )
+
     # `on_day[i][d]==1 => lo_d <= start[i] <= hi_d`, plus
     # `sum_d on_day[i][d] == placed[i]`, pins down the true day
     # one-directionally: the solver cannot "cheat" by setting the wrong day's
@@ -1151,9 +1250,9 @@ def build_model(
         # both, so a not-yet-upgraded service still applied caps), is
         # retired; there is no second field left to prefer this over.
         #
-        # Bucket every PIN to the day its start falls on, once, before
+        # Bucket every PIN to its day (`pinned_day_by_row`: the caller's day
+        # when set, else the slot range its start falls in), once, before
         # walking groups — a pin's day does not depend on which group asks.
-        pinned_day_by_row = [_day_of_pin(start_ms, day_bounds) for _court, start_ms in existing]
         pinned_on_day_by_group: dict[int, dict[int, int]] = {}
         for k, group_indices in enumerate(pinned_rule_group_indices):
             if k >= len(pinned_day_by_row):
@@ -1196,8 +1295,12 @@ def build_model(
     # movable side: day_i <= day_j (linear, unconditional -- this is what
     # fixes a whole round sitting on an earlier day than the one before it)
     # and, when they land on the same day, start_i <= start_j (reified; ties
-    # are legal -- two rounds simultaneously on different courts is fine,
-    # participant rest already prevents a real entrant overlap). The pair set
+    # are legal -- two rounds simultaneously on different courts is fine for
+    # the start floor). This floor does NOT keep two rounds' boards apart in
+    # time: for drawn boards participant rest keeps a player out of two at
+    # once, but an unpaired slot (ruling 255) has no participant, so for it
+    # only section 10b's END barrier and its round gap (ruling 256) separate
+    # one round from the next. The pair set
     # is FULL (all r < r', not adjacent-only): the conditional start half does
     # not chain through a round with no fixture on that day.
     #
@@ -1279,7 +1382,7 @@ def build_model(
             pin_round = existing_rounds[k] if k < len(existing_rounds) else None
             if pin_round is None:
                 continue
-            pin_day = _day_of_pin(existing_start, day_bounds)
+            pin_day = pinned_day_by_row[k]
             if pin_day is None:
                 continue  # off-lattice: see _day_of_pin -- counts against nothing
             for i in range(n):
@@ -1315,12 +1418,26 @@ def build_model(
         # A START or absent barrier reaches nothing below: `end_divisions` and
         # `end_pins` are empty, and the model is the pre-X-SW-31 model, byte
         # for byte.
+        #
+        # Ruling 256's round gap rides on the same constraints: the reach of
+        # an earlier board is its end PLUS its sequence's gap
+        # (`start_j >= start_i + dur_ms + gap_ms`), in every pair, a pin's
+        # included -- a pin carries no gap of its own, so it takes the gap of
+        # the movable fixture's sequence it is compared with. Under START the
+        # gap is read nowhere: it is measured from an END. With no gap the
+        # reach is `dur_ms`, the same integer as before, so a gap-free board
+        # is the X-SW-31 model byte for byte.
+        def _reach_ms(i: int) -> int:
+            return dur_ms + round_gap_by_division.get(fixtures[i][1], 0) * MIN_MS
+
         for division in sorted(end_divisions):
             rounds = [(i, fixture_rounds[i]) for i in by_division[division] if i in round_day]
             for i, ri in rounds:
                 for j, rj in rounds:
                     if ri < rj:
-                        model.Add(start[j] >= start[i] + dur_ms).OnlyEnforceIf([placed[i], placed[j]])
+                        model.Add(start[j] >= start[i] + _reach_ms(i)).OnlyEnforceIf(
+                            [placed[i], placed[j]]
+                        )
         for k in end_pins:
             pin_start = existing[k][1]
             pin_round = existing_rounds[k]
@@ -1329,9 +1446,62 @@ def build_model(
             for i in round_day:
                 ri = fixture_rounds[i]
                 if pin_round < ri:
-                    model.Add(start[i] >= pin_start + dur_ms).OnlyEnforceIf(placed[i])
+                    model.Add(start[i] >= pin_start + _reach_ms(i)).OnlyEnforceIf(placed[i])
                 elif ri < pin_round:
-                    model.Add(start[i] + dur_ms <= pin_start).OnlyEnforceIf(placed[i])
+                    model.Add(start[i] + _reach_ms(i) <= pin_start).OnlyEnforceIf(placed[i])
+
+        # section 10c: rounds per day (ruling 256). In a capped sequence, the
+        # distinct rounds with at least one board on a day number at most the
+        # cap -- the per-player daily match cap as a ROUND limit, since in a
+        # Swiss each player plays once per round and an unpaired slot has no
+        # player for a per-person cap to reach. Drawn and unpaired boards
+        # count alike; any barrier.
+        #
+        # One `round_on_day` bool per (sequence, round, day), implied by every
+        # board of that round being on that day (`on_day`, section 9's own
+        # bucketing). One-directional on purpose, like `day_used` below: the
+        # only constraint on these bools is an upper bound on their sum, so
+        # setting one the board does not need only tightens the board.
+        #
+        # Pins count as CONSTANTS. A pin's day is its caller day
+        # (`existing_day_indices`, `PinnedRow.day_index`) when set -- a
+        # same-day rebuild's slots start at "now", so the morning's played
+        # rounds fall in no slot range and only the caller's day counts them
+        # (engine review I2). Unset, it is bucketed by `_day_of_pin` as the
+        # day caps bucket it (a pin in no day counts against none). A round-bearing
+        # pin joins every round-bearing sequence, as in section 10. A round a
+        # pin already puts on the day is counted once, by the pin, so a board
+        # of that round adds nothing; the remaining room is CLAMPED at 0 --
+        # section 9's precedent -- so pins already over the cap leave the
+        # board solvable: no new round joins that day, nothing else breaks.
+        if rounds_per_day_cap:
+            pinned_rounds_by_day: dict[int, set[int]] = {}
+            for k, (_existing_court, existing_start) in enumerate(existing):
+                pin_round = existing_rounds[k] if k < len(existing_rounds) else None
+                if pin_round is None:
+                    continue
+                pin_day = pinned_day_by_row[k]
+                if pin_day is None:
+                    continue  # off-lattice: counts against nothing (see _day_of_pin)
+                pinned_rounds_by_day.setdefault(pin_day, set()).add(pin_round)
+            for division in sorted(rounds_per_day_cap):
+                cap = rounds_per_day_cap[division]
+                boards_by_round: dict[int, list[int]] = {}
+                for i in by_division[division]:
+                    if i in round_day:
+                        boards_by_round.setdefault(fixture_rounds[i], []).append(i)
+                for d in day_ids:
+                    pinned = pinned_rounds_by_day.get(d, set())
+                    lits = []
+                    for r in sorted(boards_by_round):
+                        if r in pinned:
+                            continue  # already on this day, counted by the pin
+                        on = model.NewBoolVar(f"round_on_day_{division}_{r}_{d}")
+                        for i in boards_by_round[r]:
+                            model.AddImplication(on_day[i][d], on)
+                        lits.append(on)
+                    if lits:
+                        model.Add(sum(lits) <= max(0, cap - len(pinned)))
 
     placed_sum = sum(placed)
     # The horizon `mk_lo`/`mk_hi` (and T2's gap vars) live on. It must cover
@@ -1486,13 +1656,23 @@ def build_model(
     # under a per-day objective an off-lattice pin is invisible to T1 entirely.
     # `tests/test_day_objective.py` pins that behaviour so a future reader
     # finds a decision.
-    for _court, existing_start in existing:
-        pin_day = _day_of_pin(existing_start, day_bounds)
-        if pin_day is None:
-            continue
+    #
+    # Follow-up 2: a pin with a caller day (`PinnedRow.day_index`) counts on
+    # that day even outside its slot range -- a same-day rebuild's morning.
+    # The day's variables cannot reach outside its window (their domains
+    # above), so such a pin's bounds are CLAMPED to it: a pin before the
+    # window opens the day at the window's open (offset 0), one after it
+    # closes ends the day at the window's last end. For a pin inside the
+    # window -- every pin the slot range buckets -- the clamp is the
+    # identity, so an unset day_index builds the same constraints as before.
+    for k, (_court, existing_start) in enumerate(existing):
+        pin_day = pinned_day_by_row[k]
+        if pin_day is None or pin_day not in day_used:
+            continue  # no day, or a caller day the grid does not offer
+        window_open, window_close = day_bounds[pin_day]
         model.Add(day_used[pin_day] == 1)
-        model.Add(day_lo[pin_day] <= existing_start)
-        model.Add(day_hi[pin_day] >= existing_start + dur_ms)
+        model.Add(day_lo[pin_day] <= max(existing_start, window_open))
+        model.Add(day_hi[pin_day] >= min(existing_start, window_close) + dur_ms)
 
     # `day_ids` is never empty — `grid_slots` is guarded non-empty above — so
     # all three are real linear expressions, not the bare `0` that `sum([])`
