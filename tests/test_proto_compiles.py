@@ -157,6 +157,10 @@ EXPECTED_MESSAGE_FIELDS = {
         # Ruling 255 (W3 Swiss unpaired round slots). No presence: absent and
         # false are the same bytes, the one "no flag" shape.
         "unpaired_round_slot": (7, FieldDescriptor.TYPE_BOOL, False, False),
+        # Ruling 256 (W3 Swiss round limits). No presence: absent and 0 are the
+        # same bytes, and 0 means no gap / no cap.
+        "round_gap_minutes":  (8, FieldDescriptor.TYPE_UINT32, False, False),
+        "rounds_per_day_cap": (9, FieldDescriptor.TYPE_UINT32, False, False),
     },
     "PinnedRow": {
         "court_index":        (1, FieldDescriptor.TYPE_UINT32, False, True),

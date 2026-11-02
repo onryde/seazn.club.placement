@@ -161,6 +161,8 @@ def _model(req):
         p.fixture_rounds, p.pinned_round, p.person_indices, p.allowed_courts,
         fixture_round_barriers=p.fixture_round_barriers,
         existing_round_barriers=p.pinned_round_barriers,
+        fixture_round_gap_minutes=p.fixture_round_gap_minutes,
+        fixture_rounds_per_day_caps=p.fixture_rounds_per_day_caps,
     )
 
 
@@ -448,8 +450,9 @@ def test_ruling_255_the_end_barrier_binds_an_unpaired_slot_after_an_earlier_roun
         (END, 40, False),    # ends T0+70, after the round-3 board has started
         (END, 30, True),     # ends T0+60 == the pin's start: legal
         (START, 40, True),   # start floor only: T0+40 <= T0+60 on one day
+        (START, 70, False),  # start floor: T0+70 is after the round-3 board's start
     ],
-    ids=["end-late-refused", "end-tie-legal", "start-late-legal"],
+    ids=["end-late-refused", "end-tie-legal", "start-late-legal", "start-after-the-pin-refused"],
 )
 def test_ruling_255_the_end_barrier_binds_an_unpaired_slot_before_a_later_round_pin(
     barrier, slot_at, feasible
@@ -853,3 +856,652 @@ def test_ruling_255_counted_parity_sweep_unpaired_slots_satisfy_courts_windows_a
     assert free_floor_pairs > 0, "the START twin checked no unpaired floor pair"
     assert total["parallel_rounds"] > 0, "no round's unpaired slots ever ran side by side"
     assert bites > 0, "no board ever needed the barrier for an unpaired slot"
+
+
+# === ruling 256 ===================================================================
+#
+# Ruling 256 (owner, 2026-11-01, "apply rec"): unpaired Swiss rounds keep the
+# player limits as ROUND limits. An unpaired slot has no people, so person rest
+# and per-person day caps never reach it; the sequence carries both instead:
+#
+#   * `round_gap_minutes` -- under round_barrier END, every board of round r
+#     starts no earlier than the last END of round r-1 in the same sequence
+#     plus this value. 0/absent = PR #4's END exactly. It binds pins
+#     (`existing`) as the barrier does.
+#   * `rounds_per_day_cap` -- in one sequence, the number of distinct rounds
+#     with at least one board on a calendar day is at most this value.
+#     0/absent = no cap. Paired and unpaired boards alike; pins count.
+#   * both are one value per sequence, like `round_barrier`; mixed values are
+#     refused by name.
+#
+# Every expectation below is derived by hand from that contract.
+
+#: Day 1 starts 24 hours after T0. `_t(_DAY_1 + m)` is day 1's T0+m.
+_DAY_1 = 24 * 60
+
+
+def _two_days(courts, ticks_day_0: int, ticks_day_1: int) -> list[pb.Slot]:
+    return _slots(courts, ticks_day_0) + _slots(courts, ticks_day_1, day=1, base=T0 + DAY_MS)
+
+
+def _limits_board(barrier=END, **kw) -> pb.SolveBuildRequest:
+    """Two days, two courts: round 1 drawn, rounds 2-3 unpaired, a played
+    round-1 pin on day 0 and a round-4 pin on day 1 -- every path ruling 256
+    touches (movable pairs, both pin directions, the day buckets)."""
+    fixtures = [
+        _paired([0, 1], 1, barrier=barrier, **kw),
+        _paired([2, 3], 1, barrier=barrier, **kw),
+        _slot(2, barrier=barrier, **kw),
+        _slot(2, barrier=barrier, **kw),
+        _slot(3, barrier=barrier, **kw),
+    ]
+    pins = [_pin(0, 0, 1, barrier), _pin(1, _DAY_1 + 50, 4, barrier)]
+    return _request(
+        fixtures, 2, entrant_count=4, slots=_two_days(range(2), 12, 12), existing=pins
+    )
+
+
+def _pre_256_model(req):
+    """The model `main.py` built before ruling 256: the same schema output,
+    handed to `build_model` WITHOUT the two new lists."""
+    p = request_to_model_input(req)
+    return build_model(
+        p.fixtures, p.courts, p.grid_slots, p.step_minutes, p.constraints, p.existing,
+        p.dependencies, p.rule_groups, p.pinned_rule_group_indices, p.pinned_entrant_indices,
+        p.fixture_rounds, p.pinned_round, p.person_indices, p.allowed_courts,
+        fixture_round_barriers=p.fixture_round_barriers,
+        existing_round_barriers=p.pinned_round_barriers,
+    )
+
+
+# --- the empty case first ---------------------------------------------------------
+
+
+def test_ruling_256_empty_case_first_zero_or_absent_is_one_wire_shape_and_reaches_nothing():
+    """Ruling 256 empty case first: 0 and absent are ONE wire shape for both
+    fields, the schema hands the domain all-zero lists, and those lists build
+    exactly the model the pre-256 call builds -- on a board that has every
+    path the ruling touches (movable round pairs, an earlier-round and a
+    later-round pin, two days).
+
+    Not vacuous: on the same board a gap of 10 and a cap of 2 each change the
+    model text, so the comparison can fail.
+
+    What this does NOT prove, named so nobody reads it in: that the model is
+    byte-identical to 8dd851c's. That needs 8dd851c's module beside this one,
+    so it ran out of suite -- an 800-request corpus (origin/main's 400
+    shapes, plus 400 ruling-255 shapes: unpaired slots, END/START/absent,
+    round-bearing pins on and off the lattice, one to three days, rule-group
+    day caps) diffed line for line on 8dd851c and on this tree, with this
+    tree's `build_model` called the way `main.py` now calls it. The counts
+    are in the commit body and the report."""
+    absent = pb.Fixture(division_index=0, round=2, unpaired_round_slot=True)
+    zeros = pb.Fixture(
+        division_index=0, round=2, unpaired_round_slot=True,
+        round_gap_minutes=0, rounds_per_day_cap=0,
+    )
+    assert zeros.SerializeToString() == absent.SerializeToString()
+    for field in ("round_gap_minutes", "rounds_per_day_cap"):
+        one = pb.Fixture(division_index=0, round=2, unpaired_round_slot=True, **{field: 1})
+        assert one.SerializeToString() != absent.SerializeToString()
+
+    req = _limits_board()
+    parsed = request_to_model_input(req)
+    assert parsed.fixture_round_gap_minutes == [0] * 5
+    assert parsed.fixture_rounds_per_day_caps == [0] * 5
+    zero = str(_model(req).Proto())
+    assert zero == str(_pre_256_model(req).Proto())
+
+    assert str(_model(_limits_board(round_gap_minutes=10)).Proto()) != zero
+    assert str(_model(_limits_board(rounds_per_day_cap=2)).Proto()) != zero
+
+
+def test_ruling_256_a_gap_on_a_start_sequence_reaches_nothing_and_a_cap_still_binds():
+    """The gap is defined against the previous round's END, so it is an END
+    rule: under START (or no barrier) it reaches nothing and the model is the
+    gap-free one, byte for byte. It is accepted, not refused -- a refusal
+    would send the whole request to the greedy fallback (the ruling-255
+    precedent for START). The cap is not tied to a barrier: under START it
+    still changes the model."""
+    for barrier in (START, _NO_BARRIER):
+        plain = str(_model(_limits_board(barrier)).Proto())
+        assert str(_model(_limits_board(barrier, round_gap_minutes=30)).Proto()) == plain
+        assert str(_model(_limits_board(barrier, rounds_per_day_cap=2)).Proto()) != plain
+
+
+# --- the round gap ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("gap", [0, 10, 20, 40])
+def test_ruling_256_the_gap_pushes_round_2_by_exactly_the_gap(server, gap):
+    """Ruling 256, through the real servicer. By hand -- ruling 255's
+    eight-player board with a gap: four courts, round 1 = four drawn boards,
+    round 2 = four unpaired slots, END. Every round-2 start is at or after
+    round 1's last end plus the gap, so `day_span` >= 30 + gap + 30, reached
+    only with round 1 all at T0 (any later round-1 board raises the floor)
+    and round 2 all at exactly T0 + 30 + gap."""
+    fixtures = [_paired([2 * k, 2 * k + 1], 1, round_gap_minutes=gap) for k in range(4)] + [
+        _slot(2, round_gap_minutes=gap) for _ in range(4)
+    ]
+    board = _solve(server, _request(fixtures, 4, entrant_count=8))
+    assert sorted(board) == list(range(8))
+    assert [board[i][1] for i in range(4)] == [T0] * 4
+    assert [board[i][1] for i in range(4, 8)] == [_t(MATCH_MIN + gap)] * 4
+
+
+@pytest.mark.parametrize("second", ["unpaired", "drawn"])
+@pytest.mark.parametrize(
+    ("barrier", "gap", "slot_at", "feasible"),
+    [
+        # The drawn round-1 board is forced to T0 and ends T0+30.
+        (END, 20, 40, False),   # ten minutes inside the gap
+        (END, 20, 50, True),    # round 1's end + the gap, exactly
+        (END, 0, 30, True),     # no gap: PR #4's END
+        (START, 20, 0, True),   # an END rule: the start floor's tie is still legal
+    ],
+    ids=["end-inside-gap-refused", "end-gap-exact-legal", "end-no-gap-legal", "start-gap-unread"],
+)
+def test_ruling_256_a_round_2_board_obeys_the_gap_to_the_minute(
+    barrier, gap, slot_at, feasible, second
+):
+    """Two courts, so a court clash is never the reason, and round 2's drawn
+    board has players disjoint from round 1's, so participant rest is never
+    the reason either: the gap binds drawn and unpaired boards alike."""
+    kw = dict(barrier=barrier, round_gap_minutes=gap)
+    later = _slot(2, **kw) if second == "unpaired" else _paired([2, 3], 2, **kw)
+    req = _request([_paired([0, 1], 1, **kw), later], 2, entrant_count=4)
+    model = _model(req)
+    _force(model, 0, T0)
+    _force(model, 1, _t(slot_at))
+    assert _feasible(model) is feasible
+
+
+@pytest.mark.parametrize(
+    ("pin_at", "pin_round", "slot_at", "feasible"),
+    [
+        # A round-1 pin on court 0 at T0 ends T0+30; + gap 20 = T0+50.
+        (0, 1, 40, False),   # ten minutes inside the gap after the pin
+        (0, 1, 50, True),    # the pin's end + the gap, exactly
+        # A round-3 pin at T0+80: the round-2 shell's end + 20 must be <= it,
+        # so the shell starts by T0+30.
+        (80, 3, 40, False),  # ends T0+70, + 20 = T0+90 > T0+80
+        (80, 3, 30, True),   # ends T0+60, + 20 == the pin's start
+    ],
+    ids=["after-pin-inside-gap-refused", "after-pin-exact-legal",
+         "before-pin-inside-gap-refused", "before-pin-exact-legal"],
+)
+def test_ruling_256_pins_bind_the_gap_in_both_directions(pin_at, pin_round, slot_at, feasible):
+    """The gap rides on the sequence (the movable fixtures' division); a pin
+    joins that sequence through its round, as it does for the barrier. The
+    shell can always use court 1."""
+    req = _request(
+        [_slot(2, round_gap_minutes=20)], 2, existing=[_pin(0, pin_at, pin_round)]
+    )
+    model = _model(req)
+    _force(model, 0, _t(slot_at))
+    assert _feasible(model) is feasible
+
+
+@pytest.mark.parametrize(
+    ("slot_at", "feasible"),
+    [
+        (40, False),  # round 1 ends T0+30; + gap 20 = T0+50
+        (50, True),   # exactly round 1's end + the gap
+    ],
+    ids=["inside-gap-refused", "gap-exact-legal"],
+)
+def test_ruling_256_the_gap_runs_from_every_earlier_round_not_only_r_minus_1(slot_at, feasible):
+    """T10c alignment, point 1: the gap is measured from the last end of
+    EVERY earlier round of the sequence -- the same pair set as the END
+    barrier (full r < r'), never r-1 only. The witness is a sequence with no
+    round-2 board: round 3 still keeps the gap after round 1. (Where round 2
+    has a board, round 1's end + gap is always below round 2's, so only a
+    missing round tells the two readings apart.)"""
+    req = _request(
+        [_paired([0, 1], 1, round_gap_minutes=20), _slot(3, round_gap_minutes=20)],
+        2,
+        entrant_count=2,
+    )
+    model = _model(req)
+    _force(model, 0, T0)
+    _force(model, 1, _t(slot_at))
+    assert _feasible(model) is feasible
+
+
+# --- rounds per day -----------------------------------------------------------------
+
+#: Day 0 offers T0..T0+110 on two courts; day 1 offers ONE tick, T0+1d, on two
+#: courts -- room for exactly one round of two boards.
+_CAP_DAYS = _two_days(range(2), 12, 1)
+
+
+@pytest.mark.parametrize(
+    ("cap", "round_3"),
+    [(0, [_t(60)] * 2), (3, [_t(60)] * 2), (2, [_t(_DAY_1)] * 2)],
+    ids=["uncapped", "cap-3", "cap-2"],
+)
+def test_ruling_256_cap_2_moves_round_3_to_day_2(server, cap, round_3):
+    """Ruling 256, through the real servicer. Two courts, END, `_CAP_DAYS`;
+    round 1 = two drawn boards, rounds 2 and 3 = two unpaired slots each.
+
+      uncapped, or cap 3 (= the round count): the `days` rung keeps one day
+      (day 1 cannot hold three rounds, day 0 can), and `day_span` packs the
+      rounds back to back: T0, T0+30, T0+60.
+      cap 2: every board still places -- rounds 1-2 on day 0 and round 3 on
+      day 1 is the ONLY way (round 1 alone on day 0 leaves rounds 2 and 3 to
+      share day 1's single tick, which END forbids). Day 0's span rung then
+      puts rounds 1-2 at T0, T0+30, and round 3 takes day 1's tick on both
+      courts.
+
+    Round 1 is drawn and rounds 2-3 are not, so a cap that counted only one
+    kind of board would leave round 3 on day 0."""
+    kw = dict(rounds_per_day_cap=cap)
+    fixtures = [
+        _paired([0, 1], 1, **kw), _paired([2, 3], 1, **kw),
+        _slot(2, **kw), _slot(2, **kw),
+        _slot(3, **kw), _slot(3, **kw),
+    ]
+    board = _solve(server, _request(fixtures, 2, entrant_count=4, slots=_CAP_DAYS))
+    assert sorted(board) == list(range(6))
+    assert [board[i][1] for i in (0, 1)] == [T0] * 2
+    assert [board[i][1] for i in (2, 3)] == [_t(30)] * 2
+    assert [board[i][1] for i in (4, 5)] == round_3
+
+
+@pytest.mark.parametrize("kind", ["unpaired", "drawn"])
+@pytest.mark.parametrize(
+    ("cap", "rounds", "starts", "feasible"),
+    [
+        (1, (1, 1), (0, 0), True),          # two boards of ONE round: one round
+        (1, (1, 2), (0, 30), False),        # two rounds on day 0, cap 1
+        (1, (1, 2), (0, _DAY_1), True),     # one round per day
+        (2, (1, 2), (0, 30), True),         # two rounds on day 0, cap 2
+    ],
+    ids=["one-round-two-boards", "two-rounds-cap-1-refused", "a-day-each", "two-rounds-cap-2"],
+)
+def test_ruling_256_the_cap_counts_distinct_rounds_of_drawn_or_unpaired_boards(
+    cap, rounds, starts, feasible, kind
+):
+    """Forced probes, two courts, two days of twelve ticks, END. Each pair of
+    rows differs only in the thing under test, so a model that refuses
+    everything (or nothing) cannot pass."""
+    def board(i):
+        return _slot(rounds[i], rounds_per_day_cap=cap) if kind == "unpaired" else _paired(
+            [2 * i, 2 * i + 1], rounds[i], rounds_per_day_cap=cap
+        )
+
+    req = _request([board(0), board(1)], 2, entrant_count=4, slots=_two_days(range(2), 12, 12))
+    model = _model(req)
+    _force(model, 0, _t(starts[0]))
+    _force(model, 1, _t(starts[1]))
+    assert _feasible(model) is feasible
+
+
+@pytest.mark.parametrize(
+    ("cap", "pins", "shells", "feasible"),
+    [
+        # An earlier-round pin on day 0 takes day 0's one round.
+        (1, [(0, 0, 1)], [(2, 30)], False),
+        (1, [(0, 0, 1)], [(2, _DAY_1)], True),
+        (2, [(0, 0, 1)], [(2, 30)], True),
+        # A later-round pin on day 1 takes day 1's one round.
+        (1, [(0, _DAY_1 + 60, 3)], [(2, _DAY_1)], False),
+        (1, [(0, _DAY_1 + 60, 3)], [(2, 0)], True),
+        # Pins ALREADY over the cap on day 0 (rounds 1 and 2, cap 1): a board
+        # of a round already there adds no round; a new round may not join;
+        # and the board stays solvable rather than INFEASIBLE.
+        (1, [(0, 0, 1), (0, 30, 2)], [(2, 30), (3, _DAY_1)], True),
+        (1, [(0, 0, 1), (0, 30, 2)], [(2, 30), (3, 60)], False),
+        # A pin OFF the lattice (T0+180: after day 0's last tick T0+110,
+        # before day 1) has no day, so it counts against no day's cap -- the
+        # day caps' rule (`_day_of_pin`). The same pin ON the lattice does.
+        (1, [(0, 180, 3)], [(2, 0)], True),
+        (1, [(0, 100, 3)], [(2, 0)], False),
+    ],
+    ids=[
+        "earlier-pin-same-day-refused", "earlier-pin-next-day-legal", "earlier-pin-cap-2-legal",
+        "later-pin-same-day-refused", "later-pin-day-before-legal",
+        "over-cap-pins-same-round-legal", "over-cap-pins-new-round-refused",
+        "off-lattice-pin-uncounted", "on-lattice-pin-counted",
+    ],
+)
+def test_ruling_256_pins_bind_the_cap_in_both_directions(cap, pins, shells, feasible):
+    """Forced probes, END, two courts, two days of twelve ticks. Pins are
+    (court, minutes from T0, round); shells are (round, minutes from T0). A
+    shell at a pin's time uses the other court, and every shell is placed
+    where the END barrier allows it, so the cap is the only reason a row is
+    refused."""
+    req = _request(
+        [_slot(r, rounds_per_day_cap=cap) for r, _at in shells],
+        2,
+        slots=_two_days(range(2), 12, 12),
+        existing=[_pin(c, at, r) for c, at, r in pins],
+    )
+    model = _model(req)
+    for i, (_r, at) in enumerate(shells):
+        _force(model, i, _t(at))
+    assert _feasible(model) is feasible
+
+
+@pytest.mark.parametrize(
+    ("second_day_index", "feasible"),
+    [(1, True), (0, False)],
+    ids=["two-caller-days-legal", "one-caller-day-refused"],
+)
+def test_ruling_256_the_cap_buckets_by_the_callers_day_index_never_utc(second_day_index, feasible):
+    """T10c alignment, point 2: the cap's day is the caller's `Slot.day_index`
+    -- the org's local calendar day, resolved by the app in the org's zone --
+    the same bucketing as the rule-group day caps (section 9). The service
+    has no zone field and does no UTC arithmetic. Cap 1, round 1 at T0 and
+    round 2 at T0+12h, the SAME UTC date: legal when the caller labels them
+    two days, refused when it labels them one. A UTC bucketing would refuse
+    both. (T0 is 08:00Z and T0+12h 20:00Z: for an org at UTC+5, 13:00 and
+    01:00 the next local day.)"""
+    slots = _slots(range(2), 6) + _slots(
+        range(2), 6, day=second_day_index, base=T0 + 12 * 3_600_000
+    )
+    req = _request(
+        [_slot(1, rounds_per_day_cap=1), _slot(2, rounds_per_day_cap=1)], 2, slots=slots
+    )
+    model = _model(req)
+    _force(model, 0, T0)
+    _force(model, 1, T0 + 12 * 3_600_000)
+    assert _feasible(model) is feasible
+
+
+def test_ruling_256_a_capped_request_with_a_slot_missing_its_day_is_refused(server):
+    """T10c alignment, point 2: with no caller day there is nothing to bucket
+    by, and the service never falls back to UTC -- a slot without
+    `day_index` is refused by name, as for every request (the field carries
+    the org's zone, resolved per slot)."""
+    req = _request([_slot(1, rounds_per_day_cap=1), _slot(2, rounds_per_day_cap=1)], 2)
+    req.slots[0].ClearField("day_index")
+    response = _invoke(server, req)
+    assert response.status == pb.SOLVE_STATUS_ERROR
+    assert response.error.code == "INVALID_REQUEST"
+    assert "slots[0].day_index must be set" in response.error.message
+
+
+def test_ruling_256_pins_alone_over_the_cap_leave_the_board_solvable(server):
+    """T10c alignment, point 3: a day already over the cap through pins alone
+    is not an error. Pins are never constrained; the cap only limits the
+    rounds MOVABLE boards add. By hand: cap 1, played rounds 1 and 2 pinned
+    on day 0 (two rounds, over the cap), two round-3 shells. Day 0 takes no
+    new round, so both shells go to day 1: one day used, one tick, both
+    courts, at day 1's first tick. OPTIMAL, not INFEASIBLE."""
+    req = _request(
+        [_slot(3, rounds_per_day_cap=1), _slot(3, rounds_per_day_cap=1)],
+        2,
+        slots=_two_days(range(2), 12, 12),
+        existing=[_pin(0, 0, 1), _pin(0, 30, 2)],
+    )
+    board = _solve(server, req)
+    assert sorted(board) == [0, 1]
+    assert [board[i][1] for i in (0, 1)] == [_t(_DAY_1)] * 2
+
+
+# --- one value per sequence -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("round_gap_minutes", 20), ("rounds_per_day_cap", 2)]
+)
+def test_ruling_256_mixed_values_in_one_sequence_are_refused_by_name(server, field, value):
+    """Like `round_barrier`, each value is one per sequence. Fixture 3 of
+    division 0 carries a different value from fixtures 0-2: refused, by name,
+    through the real servicer."""
+    req = _four_player_swiss(unpaired_round_2=True)
+    setattr(req.fixtures[3], field, value)
+    response = _invoke(server, req)
+    assert response.status == pb.SOLVE_STATUS_ERROR
+    assert response.error.code == "INVALID_REQUEST"
+    assert f"division 0 mixes {field} 0 and {value} (fixture 3)" in response.error.message
+
+
+def test_ruling_256_one_value_per_sequence_not_per_board_and_a_round_less_row_is_skipped(server):
+    """Not refused: two divisions with different values (each one sequence),
+    and a round-less row in division 0 carrying values of its own (a row with
+    no round is in no sequence, exactly as for `round_barrier`).
+
+    By hand, three courts. Division 0: round 1 drawn (f0), round 2 a shell
+    (f1), gap 20, cap 2; plus f4, drawn with no round. Division 1: round 1
+    drawn (f2), round 2 a shell (f3), no gap, no cap. Division 0 alone makes
+    `day_span` >= 30 + 20 + 30 = 80, met only with f1 exactly 50 after f0
+    and nothing starting before f0. Then the forced probe: division 1's round
+    2 right at its round 1's end is legal (its own gap is 0), division 0's is
+    not."""
+    fixtures = [
+        _paired([0, 1], 1, round_gap_minutes=20, rounds_per_day_cap=2),
+        _slot(2, round_gap_minutes=20, rounds_per_day_cap=2),
+        _paired([2, 3], 1, division=1),
+        _slot(2, division=1),
+        pb.Fixture(
+            entrant_indices=[4, 5], division_index=0, round_barrier=END,
+            round_gap_minutes=50, rounds_per_day_cap=1,
+        ),
+    ]
+    req = _request(fixtures, 3, entrant_count=6, division_count=2)
+    board = _solve(server, req)
+    assert sorted(board) == list(range(5))
+    assert board[1][1] - board[0][1] == 50 * MIN_MS
+
+    for i, j, gap_ms, feasible in [(2, 3, DUR, True), (0, 1, DUR, False)]:
+        model = _model(req)
+        _force(model, i, T0)
+        _force(model, j, T0 + gap_ms)
+        assert _feasible(model) is feasible
+
+
+@pytest.mark.parametrize("kwarg", ["fixture_round_gap_minutes", "fixture_rounds_per_day_caps"])
+def test_ruling_256_a_negative_round_limit_is_refused_by_the_model(kwarg):
+    """The wire carries `uint32`, so only a direct caller can send a negative
+    value; the domain refuses it rather than build a confidently wrong board
+    (a negative gap would let round 2 start before round 1 ends; a negative
+    cap would forbid every round on every day, OPTIMAL with nothing placed)."""
+    grid = [(0, _t(10 * k), 0) for k in range(6)]
+    with pytest.raises(ValueError, match=r"fixture 1 .* must be >= 0, got -10"):
+        build_model(
+            [([0, 1], 0), ([], 0)], 1, grid, STEP_MIN, {"match_minutes": MATCH_MIN}, [], [],
+            fixture_rounds=[1, 2],
+            person_indices=[[], []],
+            fixture_round_barriers=[ROUND_BARRIER_END] * 2,
+            **{kwarg: [0, -10]},
+        )
+
+
+# --- the counted parity sweep (ruling 256) ----------------------------------------
+#
+# An independent checker, written from the contract and nothing else, over
+# fixed-seed multi-day Swiss-shaped boards: one or two sequences, each with its
+# own barrier, gap and cap, drawn for its first k rounds and unpaired after.
+# Every placed board is checked against its court, and every pair of boards
+# of different rounds of one sequence against the round order, the END
+# barrier plus the gap; every (sequence, day) against the cap. Two days, and a
+# capped sequence has at most two days' worth of rounds, so every board must
+# place.
+#
+# Solved on production's EIGHT search workers (fly.toml sets
+# PLACEMENT_NUM_SEARCH_WORKERS = 8), not on the one worker the rest of this
+# file uses. Measured: on one worker, multi-day boards stall on the `day_span`
+# rung for the whole 20 s wall -- START or END, with or without a gap or cap
+# (a three-fixture START board on four days does it with no ruling-256 field
+# at all) -- while eight workers prove every board of this sweep OPTIMAL
+# through all six tiers (80 solves, 15.6 s). The checks are of the contract,
+# so they hold for any optimal board; the counts can move between runs, and
+# each is asserted only to be nonzero.
+
+@pytest.fixture
+def production_workers_server(monkeypatch):
+    monkeypatch.setenv("PLACEMENT_SERVICE_SECRET", "test-secret")
+    monkeypatch.setenv("PLACEMENT_WALL_SECONDS_MAX", "20")
+    monkeypatch.setenv("PLACEMENT_NUM_SEARCH_WORKERS", "8")
+    return grpc_testing.server_from_dictionary(
+        {SERVICE: SchedulerServicer(Settings.from_env())}, grpc_testing.strict_real_time()
+    )
+
+
+_SWEEP_256_SEEDS = range(40)
+_SWEEP_256_MIN_INSTANCES = 30
+
+
+def _sweep_256_instance(seed: int) -> dict:
+    rng = random.Random(25_600 + seed)
+    courts = rng.randint(2, 3)
+    divisions = rng.choice([1, 1, 2])
+    max_rounds = 4 if divisions == 1 else 3
+    fixtures, sequences = [], {}
+    player = 0
+    for d in range(divisions):
+        sequences[d] = dict(
+            barrier=START if rng.random() < 0.25 else END,
+            gap=rng.choice([0, 10, 20, 30]),
+            cap=rng.choice([0, 1, 2, 2, 3]),
+        )
+        boards = rng.randint(1, 2 if divisions == 1 else 1)
+        cap = sequences[d]["cap"]
+        rounds = rng.randint(2, min(max_rounds, 2 * cap) if cap else max_rounds)
+        drawn = rng.randint(0, rounds - 1)
+        field = list(range(player, player + 2 * boards))
+        player += 2 * boards
+        for r in range(1, rounds + 1):
+            order = field[:]
+            rng.shuffle(order)
+            for b in range(boards):
+                entrants = order[2 * b : 2 * b + 2] if r <= drawn else []
+                fixtures.append(dict(division=d, round=r, entrants=entrants))
+    # Two days, each open 10-14 ticks on every court: room for two rounds a
+    # day at the largest gap.
+    windows = {day: rng.randint(10, 14) for day in range(2)}
+    return dict(
+        courts=courts, divisions=divisions, players=player,
+        fixtures=fixtures, sequences=sequences, windows=windows,
+    )
+
+
+def _sweep_256_request(instance: dict, free: bool = False) -> pb.SolveBuildRequest:
+    """`free` drops the gap and the cap (the barrier stays): the twin that
+    shows whether the limits had anything to do on this board."""
+    fixtures = []
+    for f in instance["fixtures"]:
+        seq = instance["sequences"][f["division"]]
+        kw = dict(division=f["division"], barrier=seq["barrier"])
+        if not free:
+            kw.update(round_gap_minutes=seq["gap"], rounds_per_day_cap=seq["cap"])
+        fixtures.append(
+            _paired(f["entrants"], f["round"], **kw) if f["entrants"] else _slot(f["round"], **kw)
+        )
+    slots = [
+        pb.Slot(
+            court_index=c, start_at_ms=T0 + day * DAY_MS + k * STEP_MIN * MIN_MS, day_index=day
+        )
+        for day, ticks in instance["windows"].items()
+        for c in range(instance["courts"])
+        for k in range(ticks)
+    ]
+    return _request(
+        fixtures,
+        instance["courts"],
+        entrant_count=instance["players"],
+        division_count=instance["divisions"],
+        slots=slots,
+    )
+
+
+def _check_256(instance: dict, board: dict[int, tuple[int, int]]) -> dict:
+    """The contract, checked pair by pair and day by day."""
+    fixtures, sequences = instance["fixtures"], instance["sequences"]
+
+    def day_of(start: int) -> int:
+        return (start - T0) // DAY_MS  # every tick sits inside its own day's window
+
+    out = Counter()
+    breaches = []
+    placed = sorted(board.items())
+    for x, (i, (ci, si)) in enumerate(placed):
+        for j, (cj, sj) in placed[x + 1 :]:
+            fi, fj = fixtures[i], fixtures[j]
+            if ci == cj:
+                out["court_pairs"] += 1
+                if abs(si - sj) < DUR:
+                    breaches.append(("court", i, j))
+            if fi["division"] != fj["division"] or fi["round"] == fj["round"]:
+                continue
+            (a, sa), (b, sb) = ((i, si), (j, sj)) if fi["round"] < fj["round"] else ((j, sj), (i, si))
+            seq = sequences[fi["division"]]
+            unpaired = not fixtures[a]["entrants"] or not fixtures[b]["entrants"]
+            same_day = day_of(sa) == day_of(sb)
+            out["floor_pairs"] += 1
+            if day_of(sb) < day_of(sa) or (same_day and sb < sa):
+                breaches.append(("floor", a, b))
+            if seq["barrier"] != END:
+                continue
+            if seq["gap"]:
+                out["gap_pairs"] += 1
+                out["unpaired_gap_pairs"] += unpaired
+                out["same_day_gap_pairs"] += same_day
+            if sb < sa + DUR + seq["gap"] * MIN_MS:
+                breaches.append(("gap" if seq["gap"] else "end", a, b, unpaired))
+    rounds_on_day: dict[tuple[int, int], set[int]] = {}
+    drawn_on_day: dict[tuple[int, int], set[bool]] = {}
+    for i, (_court, start) in board.items():
+        key = (fixtures[i]["division"], day_of(start))
+        rounds_on_day.setdefault(key, set()).add(fixtures[i]["round"])
+        drawn_on_day.setdefault(key, set()).add(bool(fixtures[i]["entrants"]))
+    for (d, day), rounds in rounds_on_day.items():
+        cap = sequences[d]["cap"]
+        if not cap:
+            continue
+        out["cap_days"] += 1
+        out["cap_days_at_the_cap"] += len(rounds) == cap
+        out["cap_days_drawn_and_unpaired"] += len(drawn_on_day[(d, day)]) == 2
+        if len(rounds) > cap:
+            breaches.append(("cap", d, day, sorted(rounds)))
+    out["unplaced"] = len(fixtures) - len(board)
+    return {"counts": out, "breaches": breaches}
+
+
+def test_ruling_256_counted_parity_sweep_boards_satisfy_the_gap_and_the_cap(
+    production_workers_server,
+):
+    """Ruling 256 parity: over >= 30 fixed-seed multi-day Swiss boards that
+    carry a gap or a cap, the solver's own output places every board and
+    satisfies courts, the round order, the END barrier plus the gap, and the
+    rounds-per-day cap, checked by an independent checker.
+
+    Anti-vacuity, each counted and each failing at zero: instances checked
+    (>= 30), gap pairs (with an unpaired side, and on one day -- across days
+    the gap is free), capped (sequence, day)s, days AT the cap, days holding
+    drawn and unpaired boards together, and BITES -- boards whose twin
+    without the gap (or without the cap) breaks it, i.e. boards on which the
+    rule had something to do."""
+    server = production_workers_server
+    total = Counter()
+    instances = gap_bites = cap_bites = 0
+    statuses = (pb.SOLVE_STATUS_OPTIMAL, pb.SOLVE_STATUS_FEASIBLE)
+    for seed in _SWEEP_256_SEEDS:
+        instance = _sweep_256_instance(seed)
+        result = _check_256(instance, _solve(server, _sweep_256_request(instance), statuses))
+        assert result["breaches"] == [], f"seed {seed}: {result['breaches']}"
+        assert result["counts"]["unplaced"] == 0, f"seed {seed}: a board went unplaced"
+        limited = any(
+            s["cap"] or (s["gap"] and s["barrier"] == END) for s in instance["sequences"].values()
+        )
+        if not limited:
+            continue
+        instances += 1
+        total.update(result["counts"])
+        free = _check_256(instance, _solve(server, _sweep_256_request(instance, free=True), statuses))
+        gap_bites += any(b[0] == "gap" and b[3] for b in free["breaches"])
+        cap_bites += any(b[0] == "cap" for b in free["breaches"])
+    print(
+        f"ruling 256 parity: instances={instances} gap_bites={gap_bites} "
+        f"cap_bites={cap_bites} {dict(total)}"
+    )
+    assert instances >= _SWEEP_256_MIN_INSTANCES, f"only {instances} instances checked"
+    for key in (
+        "court_pairs", "floor_pairs", "gap_pairs", "unpaired_gap_pairs", "same_day_gap_pairs",
+        "cap_days", "cap_days_at_the_cap", "cap_days_drawn_and_unpaired",
+    ):
+        assert total[key] > 0, f"{key}: nothing checked"
+    assert gap_bites > 0, "no board ever needed the gap for an unpaired slot"
+    assert cap_bites > 0, "no board ever needed the cap"

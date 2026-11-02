@@ -213,10 +213,13 @@ class SchedulerServicer(scheduler_pb2_grpc.SchedulerServiceServicer):
                 parsed.pinned_round,
                 parsed.person_indices,
                 parsed.allowed_courts,
-                # X-SW-31. By name: two parallel `list[str]`s side by side
-                # are exactly what a positional slip swaps without a type error.
+                # X-SW-31 and ruling 256. By name: two parallel `list[str]`s
+                # (and two `list[int]`s) side by side are exactly what a
+                # positional slip swaps without a type error.
                 fixture_round_barriers=parsed.fixture_round_barriers,
                 existing_round_barriers=parsed.pinned_round_barriers,
+                fixture_round_gap_minutes=parsed.fixture_round_gap_minutes,
+                fixture_rounds_per_day_caps=parsed.fixture_rounds_per_day_caps,
             )
             solve_started = time.perf_counter()
             outcome = solve(model, wall_seconds=wall, knobs=self._knobs)

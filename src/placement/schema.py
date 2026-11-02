@@ -196,6 +196,16 @@ participant group, and `main.py`'s `build_model` call is unchanged. The only
 other reader is `log_unpaired_round_slots_accepted`, which `main.py` calls
 once the request has been solved. An absent or false flag validates exactly
 as before.
+
+--- ruling 256: Fixture.round_gap_minutes / Fixture.rounds_per_day_cap -------
+
+An unpaired slot has no people, so person rest and per-person day caps never
+reach it; ruling 256 keeps both as ROUND limits on the sequence. Both fields
+are plain `uint32`s (0 and absent are one shape, and both mean "none"), so
+there is nothing to range-check here: they are decoded for every row into two
+lists parallel to `fixtures` and passed to `build_model` BY NAME. The rules --
+one value per sequence, read only beside a round, the gap only under END --
+live in `placement.model`, beside the barrier's own, and are refused there.
 """
 
 from __future__ import annotations
@@ -329,6 +339,12 @@ class ModelInput:
     # the model it built before the field existed.
     fixture_round_barriers: list[str]
     pinned_round_barriers: list[str]
+    # Ruling 256 -- parallel to `fixtures`, kept off its tuple for the same
+    # reason: `fixtures[i]`'s `round_gap_minutes` and `rounds_per_day_cap`, 0
+    # when the wire left them unset. Fixture-only: a pin carries neither and
+    # takes its sequence's values in the model.
+    fixture_round_gap_minutes: list[int]
+    fixture_rounds_per_day_caps: list[int]
 
 
 #: X-SW-31. The wire's three values onto the domain's two words. UNSPECIFIED
@@ -398,6 +414,8 @@ def _validated_fixtures(
     list[list[int]],
     list[set[int] | None],
     list[str],
+    list[int],
+    list[int],
 ]:
     """The movable fixtures, with every index they carry checked for range,
     plus their C1 round numbers and C10 person indices as SEPARATE parallel
@@ -417,6 +435,8 @@ def _validated_fixtures(
     fixture_people: list[list[int]] = []
     fixture_allowed_courts: list[set[int] | None] = []
     fixture_round_barriers: list[str] = []
+    fixture_round_gap_minutes: list[int] = []
+    fixture_rounds_per_day_caps: list[int] = []
     for i, f in enumerate(proto_fixtures):
         # C10 (2026-08-16, wire person indices design) -- narrowed from "must
         # not be empty" to "neither entrants nor people": a genuinely
@@ -531,7 +551,19 @@ def _validated_fixtures(
         fixture_round_barriers.append(
             _round_barrier_of(f.round_barrier, f"fixtures[{i}].round_barrier")
         )
-    return fixtures, fixture_rounds, fixture_people, fixture_allowed_courts, fixture_round_barriers
+        # Ruling 256 -- decoded for every row like the barrier; the model
+        # reads them only beside a round.
+        fixture_round_gap_minutes.append(int(f.round_gap_minutes))
+        fixture_rounds_per_day_caps.append(int(f.rounds_per_day_cap))
+    return (
+        fixtures,
+        fixture_rounds,
+        fixture_people,
+        fixture_allowed_courts,
+        fixture_round_barriers,
+        fixture_round_gap_minutes,
+        fixture_rounds_per_day_caps,
+    )
 
 
 def _validated_rule_groups(
@@ -918,6 +950,8 @@ def request_to_model_input(req) -> ModelInput:
         fixture_people,
         fixture_allowed_courts,
         fixture_round_barriers,
+        fixture_round_gap_minutes,
+        fixture_rounds_per_day_caps,
     ) = _validated_fixtures(req.fixtures, entrant_count, division_count, person_count, num_courts)
     _log_person_only_fixtures(req.request_id, fixtures, fixture_people)
     # C1. Must run before `existing` below: `existing[].rule_group_indices`
@@ -977,6 +1011,8 @@ def request_to_model_input(req) -> ModelInput:
         allowed_courts=fixture_allowed_courts,
         fixture_round_barriers=fixture_round_barriers,
         pinned_round_barriers=pinned_round_barriers,
+        fixture_round_gap_minutes=fixture_round_gap_minutes,
+        fixture_rounds_per_day_caps=fixture_rounds_per_day_caps,
     )
 
 

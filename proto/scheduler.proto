@@ -113,10 +113,36 @@ message Fixture {
   // set. The fixture takes a court and a time and carries no person
   // constraint; every other constraint applies, `round_barrier` included. No
   // person rest applies to it, so any gap between rounds comes from
-  // `round_barrier` alone. A Swiss caller sends END; a START or absent
-  // barrier is accepted, not refused, because a refusal would send the whole
-  // request to the greedy fallback.
+  // `round_barrier` and `round_gap_minutes` alone. A Swiss caller sends END; a
+  // START or absent barrier is accepted, not refused, because a refusal would
+  // send the whole request to the greedy fallback.
   bool unpaired_round_slot = 7;
+  // Ruling 256 (W3 Swiss) -- the round gap: person rest kept as a ROUND
+  // limit, because an unpaired slot has no people for rest to reach. Under
+  // `round_barrier` END, every board of round r starts no earlier than the
+  // last end of EVERY earlier round in the same sequence (the END barrier's
+  // own pair set, not r-1 only) plus this many minutes
+  // (`start_j >= start_i + match_minutes + round_gap_minutes`). 0 or absent is
+  // END exactly. It binds a round-bearing pin in `existing` as the barrier
+  // does, with this sequence's value: a pin carries none of its own. Read only
+  // beside `round`, and one value per division (a division whose round-bearing
+  // fixtures disagree is refused). Under START or no barrier it reaches
+  // nothing: the gap is measured from an END.
+  uint32 round_gap_minutes = 8;
+  // Ruling 256 (W3 Swiss) -- rounds per day: the per-player daily match cap
+  // kept as a ROUND limit (in a Swiss each player plays once per round). In
+  // one sequence, the number of distinct rounds with at least one board on a
+  // calendar day is at most this value. The day is the caller's
+  // `Slot.day_index` -- the org's local day, resolved by the caller in the
+  // org's zone, exactly as for `RuleGroup.max_fixtures_per_day`; this service
+  // has no zone and never buckets in UTC. 0 or absent is no cap. Drawn boards,
+  // unpaired slots and round-bearing pins in `existing` all count; a pin counts
+  // on the day its start falls in, and a pin that falls in no day counts
+  // against none (the rule-group day caps' rule). Pins are never constrained:
+  // the cap limits only the rounds MOVABLE boards add to a day, so a day
+  // already over the cap through pins alone stays solvable. Read only beside
+  // `round`, one value per division, any barrier.
+  uint32 rounds_per_day_cap = 9;
 }
 
 // X-SW-31 (W3 Swiss) -- the round-order rule of one round sequence.
