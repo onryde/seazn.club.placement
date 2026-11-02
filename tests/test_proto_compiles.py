@@ -171,6 +171,9 @@ EXPECTED_MESSAGE_FIELDS = {
         "round":              (5, FieldDescriptor.TYPE_UINT32, False, True),
         # X-SW-31 (W3 Swiss round end barrier).
         "round_barrier":      (6, FieldDescriptor.TYPE_ENUM,   False, False),
+        # Engine review I2: the pin's caller day for rounds_per_day_cap. Presence
+        # tracked, like Slot.day_index: day 0 is a real day.
+        "day_index":          (7, FieldDescriptor.TYPE_INT32,  False, True),
     },
     "RuleGroup": {
         "fixture_indices":      (1, FieldDescriptor.TYPE_UINT32, True,  False),

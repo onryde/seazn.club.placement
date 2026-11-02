@@ -721,6 +721,7 @@ def build_model(
     existing_round_barriers: list[str] | None = None,
     fixture_round_gap_minutes: list[int] | None = None,
     fixture_rounds_per_day_caps: list[int] | None = None,
+    existing_day_indices: list[int | None] | None = None,
 ) -> cp_model.CpModel:
     """Build the full constraint model. No objective is set — `solve()` owns
     that, so the tier chain (Prompt 03) can drive one model through several
@@ -839,6 +840,12 @@ def build_model(
             that may have a board on one day. Read only beside a round, one
             value per division, any barrier, by section 10c. `None`, a short
             list, or 0 is no cap.
+        existing_day_indices: engine review I2 -- parallel to `existing`:
+            `existing[k]`'s caller day (`PinnedRow.day_index`, in
+            `grid_slots`' day-index space), or `None` when unset. Read only
+            by section 10c: a set day is the day the pin counts on for the
+            rounds-per-day cap; `None` (or a short list) keeps the
+            slot-range bucketing (`_day_of_pin`), byte for byte.
     """
     del step_minutes  # see the docstring: contractual, not load-bearing.
     rule_groups = rule_groups or []
@@ -848,6 +855,7 @@ def build_model(
     allowed_courts = allowed_courts or []
     fixture_rounds = fixture_rounds or []
     existing_rounds = existing_rounds or []
+    existing_day_indices = existing_day_indices or []
     # X-SW-31. Refused before anything is built, like the degenerate values
     # below: every input the engine refuses, refused here too.
     end_divisions, end_pins = _end_barrier_scope(
@@ -1437,8 +1445,12 @@ def build_model(
         # only constraint on these bools is an upper bound on their sum, so
         # setting one the board does not need only tightens the board.
         #
-        # Pins count as CONSTANTS, bucketed by `_day_of_pin` as the day caps
-        # bucket them (a pin in no day counts against none). A round-bearing
+        # Pins count as CONSTANTS. A pin's day is its caller day
+        # (`existing_day_indices`, `PinnedRow.day_index`) when set -- a
+        # same-day rebuild's slots start at "now", so the morning's played
+        # rounds fall in no slot range and only the caller's day counts them
+        # (engine review I2). Unset, it is bucketed by `_day_of_pin` as the
+        # day caps bucket it (a pin in no day counts against none). A round-bearing
         # pin joins every round-bearing sequence, as in section 10. A round a
         # pin already puts on the day is counted once, by the pin, so a board
         # of that round adds nothing; the remaining room is CLAMPED at 0 --
@@ -1450,7 +1462,12 @@ def build_model(
                 pin_round = existing_rounds[k] if k < len(existing_rounds) else None
                 if pin_round is None:
                     continue
-                pin_day = _day_of_pin(existing_start, day_bounds)
+                caller_day = existing_day_indices[k] if k < len(existing_day_indices) else None
+                pin_day = (
+                    caller_day
+                    if caller_day is not None
+                    else _day_of_pin(existing_start, day_bounds)
+                )
                 if pin_day is None:
                     continue  # off-lattice: counts against nothing (see _day_of_pin)
                 pinned_rounds_by_day.setdefault(pin_day, set()).add(pin_round)

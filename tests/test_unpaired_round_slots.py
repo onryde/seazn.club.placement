@@ -130,11 +130,11 @@ def _request(
     )
 
 
-def _pin(court: int, at_minutes: int, round_: int, barrier=END) -> pb.PinnedRow:
+def _pin(court: int, at_minutes: int, round_: int, barrier=END, **kw) -> pb.PinnedRow:
     """A played (or locked) board in `existing`, carrying its round the way
     the app forwards a played round of the one sequence on the board."""
     return pb.PinnedRow(
-        court_index=court, start_at_ms=_t(at_minutes), round=round_, round_barrier=barrier
+        court_index=court, start_at_ms=_t(at_minutes), round=round_, round_barrier=barrier, **kw
     )
 
 
@@ -163,6 +163,7 @@ def _model(req):
         existing_round_barriers=p.pinned_round_barriers,
         fixture_round_gap_minutes=p.fixture_round_gap_minutes,
         fixture_rounds_per_day_caps=p.fixture_rounds_per_day_caps,
+        existing_day_indices=p.pinned_day_index,
     )
 
 
@@ -1153,16 +1154,21 @@ def test_ruling_256_the_cap_counts_distinct_rounds_of_drawn_or_unpaired_boards(
         (1, [(0, 0, 1), (0, 30, 2)], [(2, 30), (3, _DAY_1)], True),
         (1, [(0, 0, 1), (0, 30, 2)], [(2, 30), (3, 60)], False),
         # A pin OFF the lattice (T0+180: after day 0's last tick T0+110,
-        # before day 1) has no day, so it counts against no day's cap -- the
-        # day caps' rule (`_day_of_pin`). The same pin ON the lattice does.
+        # before day 1). With no `day_index` it has no day, so it counts
+        # against no day's cap -- the slot-range rule (`_day_of_pin`), kept
+        # for a caller that does not send the day. With `day_index` 0 it
+        # counts on its calendar day (review I256-1), exactly as the same pin
+        # ON the lattice does.
         (1, [(0, 180, 3)], [(2, 0)], True),
+        (1, [(0, 180, 3, 0)], [(2, 0)], False),
         (1, [(0, 100, 3)], [(2, 0)], False),
     ],
     ids=[
         "earlier-pin-same-day-refused", "earlier-pin-next-day-legal", "earlier-pin-cap-2-legal",
         "later-pin-same-day-refused", "later-pin-day-before-legal",
         "over-cap-pins-same-round-legal", "over-cap-pins-new-round-refused",
-        "off-lattice-pin-uncounted", "on-lattice-pin-counted",
+        "off-lattice-pin-no-day-index-uncounted", "off-lattice-pin-day-index-counted",
+        "on-lattice-pin-counted",
     ],
 )
 def test_ruling_256_pins_bind_the_cap_in_both_directions(cap, pins, shells, feasible):
@@ -1170,12 +1176,15 @@ def test_ruling_256_pins_bind_the_cap_in_both_directions(cap, pins, shells, feas
     (court, minutes from T0, round); shells are (round, minutes from T0). A
     shell at a pin's time uses the other court, and every shell is placed
     where the END barrier allows it, so the cap is the only reason a row is
-    refused."""
+    refused. A pin's optional fourth element is its `day_index`."""
     req = _request(
         [_slot(r, rounds_per_day_cap=cap) for r, _at in shells],
         2,
         slots=_two_days(range(2), 12, 12),
-        existing=[_pin(c, at, r) for c, at, r in pins],
+        existing=[
+            _pin(pin[0], pin[1], pin[2], **({"day_index": pin[3]} if len(pin) > 3 else {}))
+            for pin in pins
+        ],
     )
     model = _model(req)
     for i, (_r, at) in enumerate(shells):
@@ -1505,3 +1514,240 @@ def test_ruling_256_counted_parity_sweep_boards_satisfy_the_gap_and_the_cap(
         assert total[key] > 0, f"{key}: nothing checked"
     assert gap_bites > 0, "no board ever needed the gap for an unpaired slot"
     assert cap_bites > 0, "no board ever needed the cap"
+
+
+# === PinnedRow.day_index (engine review I2) =======================================
+#
+# A pin counts against a day's `rounds_per_day_cap` on the day its start falls
+# in -- but only if it falls inside that day's SLOT range (`_day_of_pin`). A
+# same-day rebuild offers slots from "now", so the rounds played this morning
+# fall in no range and counted on no day, while the engine counts them by
+# calendar day: every same-day Swiss rebuild with a cap had its solver board
+# thrown away. `PinnedRow.day_index`, when set, is the pin's day for the cap,
+# in `Slot.day_index`'s index space; absent, nothing changes.
+
+#: A same-day rebuild at 12:00: day 0 offers T0+240..T0+350 (12:00-13:50 on
+#: two courts), day 1 a morning on court 0 only. The morning's played boards
+#: (T0, T0+30) sit BEFORE day 0's first slot.
+_REBUILD = _slots(range(2), 36, first=24) + _slots([0], 12, day=1, base=T0 + DAY_MS)
+
+
+def _morning(**kw) -> list[pb.PinnedRow]:
+    """Rounds 1 and 2, played on court 0 at 08:00 and 08:30 on day 0."""
+    return [_pin(0, 0, 1, **kw), _pin(0, 30, 2, **kw)]
+
+
+def test_pinned_day_index_empty_case_first_absent_is_its_own_shape_and_reaches_nothing():
+    """Empty case first. `day_index` has presence: absent and 0 are DIFFERENT
+    bytes, because day 0 is a real day. Absent parses to `None` per row and
+    builds, byte for byte, the model of the call without the new list -- on a
+    capped board with the morning's pins, the board the field exists for.
+    Not vacuous: `day_index=0` on the same board changes the model text.
+    Main parity (d631476) ran out of suite: see the report's corpus counts."""
+    absent = pb.PinnedRow(court_index=0, start_at_ms=T0, round=1)
+    zero = pb.PinnedRow(court_index=0, start_at_ms=T0, round=1, day_index=0)
+    assert absent.SerializeToString() != zero.SerializeToString()
+
+    req = _request(
+        [_slot(3, rounds_per_day_cap=2)], 2, slots=_REBUILD, existing=_morning()
+    )
+    p = request_to_model_input(req)
+    assert p.pinned_day_index == [None, None]
+    without = build_model(
+        p.fixtures, p.courts, p.grid_slots, p.step_minutes, p.constraints, p.existing,
+        p.dependencies, p.rule_groups, p.pinned_rule_group_indices, p.pinned_entrant_indices,
+        p.fixture_rounds, p.pinned_round, p.person_indices, p.allowed_courts,
+        fixture_round_barriers=p.fixture_round_barriers,
+        existing_round_barriers=p.pinned_round_barriers,
+        fixture_round_gap_minutes=p.fixture_round_gap_minutes,
+        fixture_rounds_per_day_caps=p.fixture_rounds_per_day_caps,
+    )
+    plain = str(_model(req).Proto())
+    assert plain == str(without.Proto())
+
+    set_req = _request(
+        [_slot(3, rounds_per_day_cap=2)], 2, slots=_REBUILD, existing=_morning(day_index=0)
+    )
+    assert request_to_model_input(set_req).pinned_day_index == [0, 0]
+    assert str(_model(set_req).Proto()) != plain
+
+
+@pytest.mark.parametrize(
+    ("day_index", "round_3"),
+    [(0, [_t(_DAY_1), _t(_DAY_1 + 30)]), (None, [_t(240), _t(240)])],
+    ids=["set-day-1", "absent-day-0"],
+)
+def test_pinned_day_index_a_same_day_rebuild_with_cap_2_takes_no_third_round_on_day_0(
+    server, day_index, round_3
+):
+    """The I2 board, through the real servicer. Cap 2; rounds 1 and 2 were
+    played this morning (08:00, 08:30) and arrive pinned; the rebuild's slots
+    start at 12:00. Two round-3 shells.
+
+      `day_index` 0: day 0 already holds two rounds, so round 3 may not join
+      it. Day 1 has one court: the shells run back to back from its first
+      tick, T0+1d and T0+1d+30.
+      absent (unchanged, the defect I2 names): the morning pins fall in no
+      slot range and count on no day, so round 3 takes day 0 -- both courts at
+      12:00, a span of 30 against day 1's 60."""
+    kw = {} if day_index is None else dict(day_index=day_index)
+    req = _request(
+        [_slot(3, rounds_per_day_cap=2), _slot(3, rounds_per_day_cap=2)],
+        2,
+        slots=_REBUILD,
+        existing=_morning(**kw),
+    )
+    board = _solve(server, req)
+    assert sorted(board) == [0, 1]
+    assert sorted(board[i][1] for i in (0, 1)) == round_3
+
+
+@pytest.mark.parametrize(
+    ("day_index", "cap", "feasible"),
+    [
+        (0, 2, False),     # the morning's two rounds fill day 0
+        (None, 2, True),   # absent: before the first slot, so on no day -- unchanged
+        (0, 3, True),      # cap 3 leaves room for round 3
+    ],
+    ids=["set-counts-refused", "absent-uncounted-legal", "set-cap-3-legal"],
+)
+def test_pinned_day_index_counts_a_pin_from_before_the_first_slot(day_index, cap, feasible):
+    """Forced probe: a round-3 shell at 12:00 on day 0 (court 1; the END
+    barrier is met -- round 2 ended at 09:00)."""
+    kw = {} if day_index is None else dict(day_index=day_index)
+    req = _request(
+        [_slot(3, rounds_per_day_cap=cap)], 2, slots=_REBUILD, existing=_morning(**kw)
+    )
+    model = _model(req)
+    _force(model, 0, _t(240))
+    assert _feasible(model) is feasible
+
+
+def test_pinned_day_index_a_negative_day_is_refused_by_name(server):
+    """Same rule as `Slot.day_index`: a day index is >= 0."""
+    req = _request(
+        [_slot(3, rounds_per_day_cap=2)], 2, slots=_REBUILD, existing=_morning(day_index=-1)
+    )
+    response = _invoke(server, req)
+    assert response.status == pb.SOLVE_STATUS_ERROR
+    assert response.error.code == "INVALID_REQUEST"
+    assert "existing[0].day_index must be >= 0, got -1" in response.error.message
+
+
+# --- review of ruling 256: I256-1, m2, and the barrier ruling ---------------------
+
+#: The production reschedule shape (review I256-1): round 1 was played on BOTH
+#: courts at day 0's first tick, so the app's grid offers that tick on no
+#: court -- day 0's slots start at T0+30 -- and day 1 offers one tick on two
+#: courts (room for one round).
+_FIRST_TICK_PLAYED = _slots(range(2), 12, first=3) + _two_days(range(2), 0, 1)
+
+
+@pytest.mark.parametrize(
+    ("day_index", "round_2", "round_3"),
+    [
+        (0, [_t(30)] * 2, [_t(_DAY_1)] * 2),
+        (None, [_t(30)] * 2, [_t(60)] * 2),
+    ],
+    ids=["day-index-counts-round-1", "no-day-index-unchanged"],
+)
+def test_ruling_256_a_round_played_on_every_court_at_the_first_tick_counts_on_its_day(
+    server, day_index, round_2, round_3
+):
+    """Review I256-1, through the real servicer. END, cap 2; round 1 pinned
+    on both courts at T0 (before day 0's first offered slot, T0+30); rounds
+    2 and 3 are two shells each.
+
+      `day_index` 0: day 0 already holds round 1, so it takes ONE more round:
+      round 2 at T0+30 on both courts, round 3 on day 1's one tick.
+      absent (kept, pins today's slot-range rule): the played round counts on
+      no day, so rounds 2 and 3 both fit day 0 -- T0+30 and T0+60, one day
+      used -- and calendar day 0 holds three rounds against a cap of 2."""
+    kw = {} if day_index is None else dict(day_index=day_index)
+    req = _request(
+        [_slot(r, rounds_per_day_cap=2) for r in (2, 2, 3, 3)],
+        2,
+        slots=_FIRST_TICK_PLAYED,
+        existing=[_pin(0, 0, 1, **kw), _pin(1, 0, 1, **kw)],
+    )
+    board = _solve(server, req)
+    assert sorted(board) == [0, 1, 2, 3]
+    assert [board[i][1] for i in (0, 1)] == round_2
+    assert [board[i][1] for i in (2, 3)] == round_3
+
+
+@pytest.mark.parametrize(
+    ("boards", "feasible"),
+    [
+        # Two capped sequences on one day: division 0 (cap 1) holds round 1,
+        # division 1 (cap 1) holds round 2. Each sequence has one round on the
+        # day: legal. A cap that counted every division's boards (reviewer
+        # mutant A) would see two.
+        ([(0, 1, 0), (1, 2, 0)], True),
+        # One sequence, cap 1: round 1 on day 0; round 2 has two boards, the
+        # FIRST on day 1 and the SECOND on day 0. Day 0 then holds rounds 1
+        # and 2: refused. A cap marked only by a round's first board
+        # (reviewer mutant B) would miss it.
+        ([(0, 1, 0), (0, 2, _DAY_1), (0, 2, 30)], False),
+        # The control: both round-2 boards on day 1.
+        ([(0, 1, 0), (0, 2, _DAY_1), (0, 2, _DAY_1)], True),
+    ],
+    ids=["per-sequence-legal", "second-board-marks-its-round-refused", "control-legal"],
+)
+def test_ruling_256_the_cap_is_per_sequence_and_every_board_marks_its_round(boards, feasible):
+    """Review m2: deterministic forced probes for the two mutants only the
+    8-worker sweep used to catch. Boards are (division, round, minutes from
+    T0); two courts, two days of twelve ticks, END, cap 1 everywhere."""
+    req = _request(
+        [_slot(r, division=d, rounds_per_day_cap=1) for d, r, _at in boards],
+        2,
+        division_count=2,
+        slots=_two_days(range(2), 12, 12),
+    )
+    model = _model(req)
+    for i, (_d, _r, at) in enumerate(boards):
+        _force(model, i, _t(at))
+    assert _feasible(model) is feasible
+
+
+@pytest.mark.parametrize("barrier", [END, START, _NO_BARRIER], ids=["end", "start", "absent"])
+@pytest.mark.parametrize(
+    ("round_2_at", "feasible"),
+    [(30, False), (_DAY_1, True)],
+    ids=["same-day-refused", "next-day-legal"],
+)
+def test_ruling_256_the_cap_binds_under_every_barrier(barrier, round_2_at, feasible):
+    """Barrier ruling (coordinator; the engine applies the same):
+    `rounds_per_day_cap` applies under ANY barrier. Cap 1: round 1 at T0,
+    round 2 at T0+30 on the same day is refused under END, START and no
+    barrier alike; on day 1 it is legal under all three."""
+    req = _request(
+        [_slot(1, barrier=barrier, rounds_per_day_cap=1),
+         _slot(2, barrier=barrier, rounds_per_day_cap=1)],
+        2,
+        slots=_two_days(range(2), 12, 12),
+    )
+    model = _model(req)
+    _force(model, 0, T0)
+    _force(model, 1, _t(round_2_at))
+    assert _feasible(model) is feasible
+
+
+@pytest.mark.parametrize("barrier", [START, _NO_BARRIER], ids=["start", "absent"])
+def test_ruling_256_the_gap_is_ignored_not_refused_under_start_or_no_barrier(server, barrier):
+    """Barrier ruling: `round_gap_minutes` applies only under END; under
+    START or no barrier it is ignored, NOT refused. Through the real
+    servicer: ruling 255's eight-player board (four courts; round 1 drawn,
+    round 2 four shells) with gap 20 is solved OPTIMAL, and round 2 sits at
+    T0+30 -- round 1's end, no gap. By hand, under the start floor: 8 boards
+    on 4 courts make `day_span` >= 60, met only with round 1 at T0 on all
+    four courts and round 2 at T0+30 (a round-1 board at T0+30 would push a
+    fifth board onto that tick). Under END the same board puts round 2 at
+    T0+50 (`..._the_gap_pushes_round_2_by_exactly_the_gap[20]`)."""
+    fixtures = [
+        _paired([2 * k, 2 * k + 1], 1, barrier=barrier, round_gap_minutes=20) for k in range(4)
+    ] + [_slot(2, barrier=barrier, round_gap_minutes=20) for _ in range(4)]
+    board = _solve(server, _request(fixtures, 4, entrant_count=8))
+    assert sorted(board) == list(range(8))
+    assert [board[i][1] for i in range(4)] == [T0] * 4
+    assert [board[i][1] for i in range(4, 8)] == [_t(30)] * 4

@@ -345,6 +345,10 @@ class ModelInput:
     # takes its sequence's values in the model.
     fixture_round_gap_minutes: list[int]
     fixture_rounds_per_day_caps: list[int]
+    # Engine review I2 -- parallel to `existing`: `existing[k]`'s caller day
+    # (`PinnedRow.day_index`), or `None` when unset. Read only by the
+    # rounds-per-day cap.
+    pinned_day_index: list[int | None]
 
 
 #: X-SW-31. The wire's three values onto the domain's two words. UNSPECIFIED
@@ -646,7 +650,12 @@ def _validated_slots(proto_slots, num_courts: int) -> list[tuple[int, int, int]]
 def _validated_existing(
     rows, num_courts: int, num_rule_groups: int, entrant_count: int
 ) -> tuple[
-    list[tuple[int, int]], list[list[int]], list[list[int]], list[int | None], list[str]
+    list[tuple[int, int]],
+    list[list[int]],
+    list[list[int]],
+    list[int | None],
+    list[str],
+    list[int | None],
 ]:
     """`existing`, plus its four C4/C6/C1/X-SW-31 companions -- kept as SEPARATE
     parallel lists (same length and order as the returned `existing`) rather
@@ -660,6 +669,7 @@ def _validated_existing(
     entrant_indices_by_row: list[list[int]] = []
     round_by_row: list[int | None] = []
     round_barrier_by_row: list[str] = []
+    day_index_by_row: list[int | None] = []
     for i, a in enumerate(rows):
         _require_index_present(a.HasField("court_index"), f"existing[{i}].court_index")
         court_index = _require_index_range(a.court_index, num_courts, f"existing[{i}].court_index")
@@ -698,7 +708,27 @@ def _validated_existing(
         round_barrier_by_row.append(
             _round_barrier_of(a.round_barrier, f"existing[{i}].round_barrier")
         )
-    return out, rule_group_indices_by_row, entrant_indices_by_row, round_by_row, round_barrier_by_row
+        # Engine review I2 -- the pin's caller day, or `None` when the wire
+        # left it unset (then the model buckets the pin by slot range, as
+        # before). Day 0 is a real day, hence presence; >= 0 like
+        # `Slot.day_index`. No range check against the grid's days: a day the
+        # grid does not offer holds no movable board, so the pin binds nothing.
+        if a.HasField("day_index"):
+            if a.day_index < 0:
+                raise InvalidRequestError(
+                    f"existing[{i}].day_index must be >= 0, got {a.day_index!r}."
+                )
+            day_index_by_row.append(a.day_index)
+        else:
+            day_index_by_row.append(None)
+    return (
+        out,
+        rule_group_indices_by_row,
+        entrant_indices_by_row,
+        round_by_row,
+        round_barrier_by_row,
+        day_index_by_row,
+    )
 
 
 def _validated_dependencies(pairs, num_fixtures: int) -> list[tuple[int, int]]:
@@ -974,6 +1004,7 @@ def request_to_model_input(req) -> ModelInput:
         pinned_entrant_indices,
         pinned_round,
         pinned_round_barriers,
+        pinned_day_index,
     ) = _validated_existing(req.existing, num_courts, len(rule_groups), entrant_count)
     _log_round_end_barrier(
         req.request_id,
@@ -1013,6 +1044,7 @@ def request_to_model_input(req) -> ModelInput:
         pinned_round_barriers=pinned_round_barriers,
         fixture_round_gap_minutes=fixture_round_gap_minutes,
         fixture_rounds_per_day_caps=fixture_rounds_per_day_caps,
+        pinned_day_index=pinned_day_index,
     )
 
 

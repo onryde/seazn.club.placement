@@ -220,6 +220,7 @@ class SchedulerServicer(scheduler_pb2_grpc.SchedulerServiceServicer):
                 existing_round_barriers=parsed.pinned_round_barriers,
                 fixture_round_gap_minutes=parsed.fixture_round_gap_minutes,
                 fixture_rounds_per_day_caps=parsed.fixture_rounds_per_day_caps,
+                existing_day_indices=parsed.pinned_day_index,
             )
             solve_started = time.perf_counter()
             outcome = solve(model, wall_seconds=wall, knobs=self._knobs)
