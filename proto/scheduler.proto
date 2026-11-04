@@ -321,10 +321,16 @@ enum SolveStatus {
 
 // One rung of the lexicographic objective chain and the value it PROVED.
 message Tier {
-  // `placed` | `days` | `day_span` | `day_start` | `idle_gap` | `imbalance`,
-  // in that order. Shared vocabulary with the TypeScript caller; see the DDD
-  // standard's ubiquitous-language rule. A tier name is a fixed protocol
-  // constant, not caller data.
+  // `placed` | `days` | `day_span` | `day_start` | `idle_gap` | `imbalance` |
+  // `day_rank`, in that order. Shared vocabulary with the TypeScript caller;
+  // see the DDD standard's ubiquitous-language rule. A tier name is a fixed
+  // protocol constant, not caller data.
+  //
+  // `day_rank` joined LAST on 2026-11-04: the sum, over every match on the
+  // board with a day, of that day's rank among the grid's days in time order
+  // (0 = the first). A tie-break, so a board whose every other rung ties
+  // lands on the earliest day rather than wherever the search race left it.
+  // The count moved 6 -> 7 with it, on both sides together.
   //
   // `makespan` was RETIRED here on 2026-08-13, not renamed. It meant
   // whole-board span, which on a multi-day board is mostly measuring the

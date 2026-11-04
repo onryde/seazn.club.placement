@@ -515,6 +515,11 @@ class FixtureVars:
     day_start: Any
     worst_gap: Any
     imbalance: Any
+    #: The earliest-day tie-break (owner ruling 2026-11-04): the sum, over
+    #: every match on the board that has a day, of that day's RANK among the
+    #: grid's days in time order. Exact everywhere, like `placed_sum`: a sum
+    #: of literals and constants. See `build_model`'s `day_rank` section.
+    day_rank: Any
 
 
 class ScheduleModel(cp_model.CpModel):
@@ -1681,6 +1686,47 @@ def build_model(
     day_span_total = sum(day_span_terms)
     day_start_total = sum(day_start_terms)
 
+    # `day_rank`: the earliest-day tie-break, the LAST rung (owner ruling
+    # 2026-11-04, seazn.club W3 X-SW-29).
+    #
+    # WHY IT EXISTS. Every rung above it is unchanged by sliding a whole board
+    # one calendar day: `days` counts days, `day_span`/`day_start` measure
+    # inside a day, and `idle_gap`/`imbalance` never look at the day at all.
+    # So a lattice that holds a second, EMPTY day — seazn.club adds a day of
+    # slack after greedy's last end when the organiser set no end date —
+    # carries two proved optima, the board on day 0 and the same board on
+    # day 1, and the race between search workers picked one (day 1 in 9/60
+    # runs on a CI-sized box). Ranked last, this decides ONLY between boards
+    # every earlier rung already calls equal: each earlier rung is frozen as a
+    # hard bound before it runs.
+    #
+    # RANK, NOT THE CALLER'S LABEL. A day's rank is its position among the
+    # grid's days in TIME order (`ordered_days`, above), so "earliest" cannot
+    # depend on what integers a caller chose for its days. seazn.club labels
+    # them densely in time order (`buildDayIndexOf`), where the two coincide.
+    #
+    # PER MATCH, NOT PER USED DAY. Summing over matches also prefers an
+    # earlier spread among the days the board must use, not only an earlier
+    # set of days, so fewer boards are left tied at the bottom of the ladder.
+    #
+    # PINS COUNT, as a constant. A pin is a match on the board: one with a day
+    # (`pinned_day_by_row`, the same one rule every per-day section uses) adds
+    # its day's rank; one with no grid day adds nothing, exactly as T1 skips
+    # it. A constant cannot move the optimum; it makes the reported value the
+    # whole board's, measured the way seazn.club's `boardMetrics.dayRankSum`
+    # measures a board (pins and movables alike). The two numbers agree only
+    # as far as the two boards do: the wire's `existing` also carries other
+    # divisions' rows, which the engine's incumbent does not — the same
+    # boundary every per-day rung already has, and nothing compares them.
+    rank_of_day = {d: k for k, (d, _bounds) in enumerate(ordered_days)}
+    rank_vars = [on_day[i][d] for i in range(n) for d in day_ids]
+    rank_coeffs = [rank_of_day[d] for _i in range(n) for d in day_ids]
+    pinned_rank = sum(rank_of_day[day] for day in pinned_day_by_row if day in rank_of_day)
+    # `WeightedSum` + a constant is always a linear expression, even when every
+    # coefficient is 0 (a one-day grid): a bare `sum` of `0 * literal` terms
+    # can collapse to the int 0 that `Minimize` and the freeze do not take.
+    day_rank = cp_model.LinearExpr.WeightedSum(rank_vars, rank_coeffs) + pinned_rank
+
     # T3: court imbalance — busiest configured-or-used court minus the
     # quietest, in ms, exactly `boardMetrics.courtImbalanceMinutes`.
     #
@@ -1854,6 +1900,7 @@ def build_model(
         day_start=day_start_total,
         worst_gap=worst_gap,
         imbalance=imbalance,
+        day_rank=day_rank,
     )
     log.debug(
         "model_built",
@@ -1876,7 +1923,7 @@ def solve(
     wall_seconds: float,
     knobs: SolverKnobs = DEFAULT_SOLVER_KNOBS,
 ) -> SolveOutcome:
-    """Solve `model` through the full lexicographic T0->T5 tier chain within
+    """Solve `model` through the full lexicographic tier chain (`objective.TIER_ORDER`) within
     `wall_seconds`.
 
     A thin wrapper over `placement.objective.run_tier_chain`, which owns the

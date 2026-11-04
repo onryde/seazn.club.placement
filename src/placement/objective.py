@@ -1,7 +1,8 @@
-"""The T0->T5 lexicographic objective chain.
+"""The lexicographic objective chain, seven rungs.
 
 T0 max-placed -> T1a days used -> T1b summed per-day span -> T1c summed per-day
-start offset -> T2 worst idle gap -> T3 court imbalance, in that fixed order.
+start offset -> T2 worst idle gap -> T3 court imbalance -> T4 summed day rank
+(the earliest-day tie-break, 2026-11-04), in that fixed order.
 
 T1 was ONE rung (whole-board `makespan`) until 2026-08-13; see `TIER_ORDER`
 below and `placement.model`'s T1 section for why a whole-board span on a
@@ -185,6 +186,13 @@ TIER_DAY_SPAN = "day_span"
 TIER_DAY_START = "day_start"
 TIER_IDLE_GAP = "idle_gap"
 TIER_IMBALANCE = "imbalance"
+#: Added 2026-11-04 (owner ruling, seazn.club W3 X-SW-29). Named like its
+#: siblings: `day_span` and `day_start` are per-day quantities summed over the
+#: board, and this is a per-match one summed the same way — the rank of each
+#: match's day among the grid's days. NOT `earliest_day`: a published
+#: `earliest_day: 4` reads as "day 4", where it means four matches one day
+#: late, and a name that misreads its own number is how `makespan` went.
+TIER_DAY_RANK = "day_rank"
 
 # The ORDER is the product ruling, not an implementation detail:
 #
@@ -198,6 +206,15 @@ TIER_IMBALANCE = "imbalance"
 #     exists to kill (`tests/test_day_objective.py` asserts the resulting
 #     idle_gap as an EQUALITY on the worse value, so the ordering is pinned
 #     and not merely the presence of the term).
+#   * `day_rank` LAST, below everything (2026-11-04). It is a tie-break and
+#     nothing else: every rung above it is blind to a whole-board shift of one
+#     calendar day, so a lattice with a spare empty day had two proved optima
+#     and the search-worker race picked the later one about one run in six on
+#     CI-sized hardware. Ranked last it can only choose between boards every
+#     earlier rung calls equal, so no earlier optimum moves
+#     (`tests/test_day_rank.py` asserts `days` and `day_start` still winning
+#     when they prefer the later day). seazn.club's `TIER_NAMES` must equal
+#     this tuple exactly, so the two ship together.
 TIER_ORDER: tuple[str, ...] = (
     TIER_PLACED,
     TIER_DAYS,
@@ -205,6 +222,7 @@ TIER_ORDER: tuple[str, ...] = (
     TIER_DAY_START,
     TIER_IDLE_GAP,
     TIER_IMBALANCE,
+    TIER_DAY_RANK,
 )
 #: `build.ts`'s `TIER_COUNT`. Reaching it means every tier was PROVED optimal.
 TIER_COUNT = len(TIER_ORDER)
@@ -231,7 +249,8 @@ _TIER_SPECS: dict[str, _TierSpec] = {
     # a FLOOR (`>=`). Also the only exact term of the four: a sum of literals
     # reads true whether or not it is the current objective.
     TIER_PLACED: _TierSpec(TIER_PLACED, maximize=True, term=lambda fv: fv.placed_sum),
-    # T1-T5 minimise, and freeze CEILINGS (`<=`) — `Tier.atMost` in build.ts.
+    # Every rung below T0 minimises, and freezes a CEILING (`<=`) — `Tier.atMost`
+    # in build.ts.
     #
     # `day_span` and `day_start` are one-sided in the same way `makespan` and
     # `worst_gap` are (see the module docstring), with one consequence worth
@@ -251,6 +270,9 @@ _TIER_SPECS: dict[str, _TierSpec] = {
     TIER_DAY_START: _TierSpec(TIER_DAY_START, maximize=False, term=lambda fv: fv.day_start),
     TIER_IDLE_GAP: _TierSpec(TIER_IDLE_GAP, maximize=False, term=lambda fv: fv.worst_gap),
     TIER_IMBALANCE: _TierSpec(TIER_IMBALANCE, maximize=False, term=lambda fv: fv.imbalance),
+    # Exact everywhere (a sum of `on_day` literals plus the pins' constant), so
+    # unlike the one-sided rungs it needs nothing above it to read true.
+    TIER_DAY_RANK: _TierSpec(TIER_DAY_RANK, maximize=False, term=lambda fv: fv.day_rank),
 }
 
 

@@ -105,6 +105,7 @@ from _board_positional import rule_groups_for, to_positional
 from placement.model import MIN_MS, build_model, solve
 from placement.objective import (
     TIER_COUNT,
+    TIER_DAY_RANK,
     TIER_DAY_SPAN,
     TIER_DAY_START,
     TIER_DAYS,
@@ -202,6 +203,13 @@ T2_PROVED_IDLE_GAP_MS = 170_400_000
 #: Unchanged by the T1 rework, which is itself worth recording — T3 is below
 #: everything that moved, and it still proves the same optimum.
 T3_PROVED_IMBALANCE_MS = 2_400_000
+
+#: `day_rank` (2026-11-04, the earliest-day tie-break): proved 324 on this board,
+#: pins included, measured identical over 2 runs at load 128-157 (it proved in
+#: 1.4-1.8 s there, against `idle_gap`'s 34-38 s). Asserted with `==` for the
+#: same reason as the four above, and recomputed from the returned board by
+#: `_day_rank_of` below, so the number must also DESCRIBE the board it came with.
+T4_PROVED_DAY_RANK = 324
 
 #: The same optima on the PIN-FREE board (`_model_without_pins`), for the two
 #: chain-behaviour tests that run there. Measured 6/6 identical.
@@ -388,9 +396,9 @@ def chain(board):
 
 
 def test_every_tier_completes_on_production_board(chain):
-    assert chain.tiers_completed == TIER_COUNT == 6
+    assert chain.tiers_completed == TIER_COUNT == 7
     names = [name for name, _ in chain.objective_values]
-    assert names == ["placed", "days", "day_span", "day_start", "idle_gap", "imbalance"]
+    assert names == ["placed", "days", "day_span", "day_start", "idle_gap", "imbalance", "day_rank"]
 
 
 def test_tier_order_is_lexicographic_not_weighted(chain):
@@ -742,6 +750,35 @@ def test_t3_reports_the_proved_minimum_court_imbalance(chain):
     measured, the same T3 mutation was green at a 22 s wall and red at 44 s.
     """
     assert _proved(chain, TIER_IMBALANCE, 6) == T3_PROVED_IMBALANCE_MS
+
+
+def _day_rank_of(assignments, existing, grid_slots):
+    """`day_rank` recomputed from a returned board, by a second route: each
+    match's day is the label of the grid tick it starts on (a pin's, of the
+    tick range its start falls in), ranked by the day's first tick in time.
+    A pin on no day's range adds nothing, as in the model."""
+    day_of_start = {start: day for _court, start, day in grid_slots}
+    first_tick: dict[int, int] = {}
+    last_tick: dict[int, int] = {}
+    for start, day in day_of_start.items():
+        first_tick[day] = min(first_tick.get(day, start), start)
+        last_tick[day] = max(last_tick.get(day, start), start)
+    rank = {day: k for k, day in enumerate(sorted(first_tick, key=first_tick.__getitem__))}
+    total = sum(rank[day_of_start[start]] for _i, _court, start in assignments)
+    for _court, start in existing:
+        days = [day for day in rank if first_tick[day] <= start <= last_tick[day]]
+        total += rank[days[0]] if days else 0
+    return total
+
+
+def test_t4_reports_the_proved_minimum_day_rank_and_it_describes_the_board(chain, board):
+    """`day_rank` MINIMISES, and its number is the returned board's. A
+    maximising rung would report a larger sum (the board's matches pushed to
+    its latest admissible days within every earlier bound), and a rung whose
+    term had drifted from the board would disagree with the recompute."""
+    _fixtures, _courts, grid_slots, _step, _constraints, existing, _deps, _groups = board
+    assert _proved(chain, TIER_DAY_RANK, 7) == T4_PROVED_DAY_RANK
+    assert _day_rank_of(chain.assignments, existing, grid_slots) == T4_PROVED_DAY_RANK
 
 
 def test_tier_directions_are_pinned_without_the_clock():
