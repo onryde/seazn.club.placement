@@ -4,7 +4,10 @@ Design of record: `docs/superpowers/specs/2026-08-11-t1-day-aware-objective-desi
 (#512, the first two rungs) and `docs/superpowers/specs/2026-08-12-t1-day-start-rung-design.md`
 (the third). Together they replace the single whole-board `makespan` term:
 
-    placed -> days -> day_span -> day_start -> idle_gap -> imbalance
+    placed -> days -> day_span -> day_start -> idle_gap -> imbalance -> day_rank
+
+(`day_rank`, the earliest-day tie-break below them all, has its own file:
+`tests/test_day_rank.py`.)
 
 WHY THESE BOARDS LOOK OVER-BUILT. Every board below is constructed so its two
 arms are STRICTLY ordered — the rung under test has a different optimum from
@@ -27,6 +30,7 @@ also the real mechanism behind the reported symptom.
 from placement.model import DAY_MS, MIN_MS, build_model, solve
 from placement.objective import (
     TIER_COUNT,
+    TIER_DAY_RANK,
     TIER_DAY_SPAN,
     TIER_DAY_START,
     TIER_DAYS,
@@ -357,9 +361,12 @@ def test_an_unplaceable_board_reports_no_negative_day_term():
 # --- the wire (C2 acceptance) ------------------------------------------------
 
 
-def test_the_chain_reports_six_tiers_with_day_start_in_position_four():
+def test_the_chain_reports_seven_tiers_with_day_start_in_position_four():
     """The wire contract the C2 brief names: `objective_values` carries
-    `day_start` at position 4, and `tiers_completed` reflects a 6-rung chain.
+    `day_start` at position 4, and `tiers_completed` reflects the whole chain
+    — seven rungs since `day_rank` joined at the bottom on 2026-11-04 (six
+    when this test was written; the count moved, `day_start`'s position did
+    not).
 
     Position is asserted by INDEX, not by membership. The chain order IS the
     product ruling (`day_start` below `day_span` so the anchor acts on an
@@ -380,7 +387,7 @@ def test_the_chain_reports_six_tiers_with_day_start_in_position_four():
     )
     names = [name for name, _ in outcome.objective_values]
 
-    assert outcome.tiers_completed == TIER_COUNT == 6, outcome.objective_values
+    assert outcome.tiers_completed == TIER_COUNT == 7, outcome.objective_values
     assert names == [
         TIER_PLACED,
         TIER_DAYS,
@@ -388,6 +395,7 @@ def test_the_chain_reports_six_tiers_with_day_start_in_position_four():
         TIER_DAY_START,
         TIER_IDLE_GAP,
         TIER_IMBALANCE,
+        TIER_DAY_RANK,
     ]
     assert names == list(TIER_ORDER)
     assert names[3] == "day_start"
