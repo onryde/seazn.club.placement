@@ -17,7 +17,7 @@ Two names are load-bearing and must not be changed:
 
 | | |
 |---|---|
-| Service app | `placement` — Fly's private DNS derives from the app name, and `packages/scheduler/src/placement-client.ts`'s `DEFAULT_HOST` is the literal `placement.flycast:50051` |
+| Service app | `placement-prod` — Fly's private DNS derives from the app name, and `packages/scheduler/src/placement-client.ts`'s `DEFAULT_HOST` is the literal `placement-prod.flycast:50051` |
 | Web app | `seazn-club-prod` (seazn.club's root `fly.toml`) |
 
 Rename the service app and every solve dials a host that does not exist: the
@@ -46,7 +46,7 @@ addresses you don't need to keep Machines running for the app to be
 reachable."*
 
 ```bash
-fly ips allocate-v6 --private --app placement
+fly ips allocate-v6 --private --app placement-prod
 ```
 
 Skip it and the symptom is not an error — it is **greedy boards, silently**,
@@ -60,13 +60,13 @@ WireGuard-encrypted and not internet-reachable, which is *why* a shared
 secret substitutes for mTLS. A public IP invalidates that assumption.
 
 ```bash
-fly ips list --app placement     # expect the private v6 ONLY — no public v4/v6
+fly ips list --app placement-prod     # expect the private v6 ONLY — no public v4/v6
 ```
 
 If Fly allocated a public one anyway, release it before deploying:
 
 ```bash
-fly ips release <address> --app placement
+fly ips release <address> --app placement-prod
 ```
 
 ## 4. Set the shared secret on BOTH apps
@@ -79,7 +79,7 @@ a chat, a commit, or a ticket.
 
 ```bash
 SECRET=$(openssl rand -base64 32)
-fly secrets set PLACEMENT_SERVICE_SECRET="$SECRET" --app placement
+fly secrets set PLACEMENT_SERVICE_SECRET="$SECRET" --app placement-prod
 fly secrets set PLACEMENT_SERVICE_SECRET="$SECRET" --app seazn-club-prod
 unset SECRET
 ```
@@ -206,7 +206,7 @@ fly secrets set PLACEMENT_SERVICE_HOST="placement-stg.flycast:50051" --app seazn
 
 This is the whole code-side story. `placement-client.ts` reads
 `PLACEMENT_SERVICE_HOST` and falls back to `DEFAULT_HOST =
-"placement.flycast:50051"` only when it is unset, so the override already
+"placement-prod.flycast:50051"` only when it is unset, so the override already
 exists and nothing ships to make this work.
 
 **Verify it took, and do not skip this.** If the variable is missing or
@@ -218,7 +218,7 @@ in `placement-stg`'s log and not in `placement`'s:
 ```bash
 fly secrets list --app seazn-club-stg | grep PLACEMENT_SERVICE_HOST
 fly logs --app placement-stg    # run a staging Auto-schedule; expect one `solve request=` line
-fly logs --app placement        # the same run must add NOTHING here
+fly logs --app placement-prod        # the same run must add NOTHING here
 ```
 
 That per-solve log line is the one added after four production deploys measured
@@ -236,7 +236,7 @@ the TOML:
 ```bash
 fly secrets set PLACEMENT_LOG_LEVEL="DEBUG" --app placement-stg
 fly secrets list --app placement-stg | grep PLACEMENT_LOG_LEVEL
-fly secrets list --app placement     | grep PLACEMENT_LOG_LEVEL   # expect nothing
+fly secrets list --app placement-prod     | grep PLACEMENT_LOG_LEVEL   # expect nothing
 ```
 
 `resolve_log_level` treats an unknown name as INFO rather than refusing to
@@ -298,13 +298,13 @@ path.
 - [ ] Run one real Auto-schedule on `stg.seazn.club`, on a **multi-court** board. The result strip
   reports the `optimized` engine, not the greedy fallback (step 7).
 - [ ] Attribute that solve by log: `placement-stg` shows exactly one `solve request=` line for it
-  and `placement` shows nothing for it.
+  and `placement-prod` shows nothing for it.
 - [ ] Record the commit sha, the date and who ran the check in the tag's release notes.
 
 ```bash
 fly secrets list --app seazn-club-stg | grep PLACEMENT_SERVICE_HOST
 fly logs --app placement-stg    # expect one `solve request=` line for the run
-fly logs --app placement        # the same run must add NOTHING here
+fly logs --app placement-prod        # the same run must add NOTHING here
 ```
 
 Any box that cannot be ticked is a stop: fix it on `stg` first. Later tags follow the ordinary
@@ -321,7 +321,7 @@ second build.
 | Workflow | Job | Runs | Deploys |
 |---|---|---|---|
 | `.github/workflows/stg.yml` | `deploy-stg` | when `ci` succeeds for a push to `main`, while that commit is still the tip of `main` | that commit's image to `placement-stg` |
-| `.github/workflows/prod.yml` | `deploy` | on a `v*.*.*` tag | the tagged commit's image to `placement` |
+| `.github/workflows/prod.yml` | `deploy` | on a `v*.*.*` tag | the tagged commit's image to `placement-prod` |
 
 - There is no paths filter: the whole repository is the service.
 - Both fail before deploying if the commit has no published image (or its package is
@@ -348,14 +348,14 @@ The manual path below remains valid for a first deploy or a rollback. It builds 
 Fly's builder from your checkout:
 
 ```bash
-fly deploy . --app placement --no-public-ips
+fly deploy . --app placement-prod --no-public-ips
 ```
 
 To roll back to an image CI already tested, deploy that sha instead (the same flags
 the workflow uses):
 
 ```bash
-fly deploy --config fly.toml --app placement --no-public-ips \
+fly deploy --config fly.toml --app placement-prod --no-public-ips \
   --image ghcr.io/onryde/seazn-placement:<commit sha>
 ```
 
@@ -366,7 +366,7 @@ proxy — much faster than the 1-3s cold start a full `stop` would cost, which
 matters against an 8-10s wall budget.
 
 ```bash
-fly scale count 10 --app placement
+fly scale count 10 --app placement-prod
 ```
 
 This call **is** needed now (Task 12 — an earlier draft of this step said
@@ -402,8 +402,8 @@ This is the setting that makes step 2 non-optional. Suspended plus
 ## 6. Verify before touching the web app
 
 ```bash
-fly status --app placement       # 10 machines (after step 5's fly scale count 10), tcp checks passing
-fly logs --app placement         # expect a bind on 50051, no tracebacks
+fly status --app placement-prod       # 10 machines (after step 5's fly scale count 10), tcp checks passing
+fly logs --app placement-prod         # expect a bind on 50051, no tracebacks
 ```
 
 Expect most of the ten machines to report `suspended` shortly after deploy
@@ -427,7 +427,7 @@ INERT").
 
 If it says greedy, work through, in order: **private v6 allocated so
 `.flycast` resolves (step 2)** — the most likely cause now that the machine
-suspends — then secret set on both apps (step 4), app named exactly `placement`
+suspends — then secret set on both apps (step 4), app named exactly `placement-prod`
 (step 1), machine actually deployed (step 5), and — new as of Task 12 —
 **every solve landing on one machine because the caller reused a channel**:
 `placement-client.ts` opens a fresh gRPC client per solve and closes it when that

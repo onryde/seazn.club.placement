@@ -56,7 +56,7 @@ EXPECTED_TIMEOUT = 20
 VERIFY_BY_LOG_ATTRIBUTION = (
     "echo \"::notice::VERIFY BY LOG ATTRIBUTION, not by reading the env var: run one Auto-schedule on "
     "stg.seazn.club, then 'fly logs --app placement-stg' must show a 'solve request=' line and "
-    "'fly logs --app placement' must show NOTHING for it. A misspelled PLACEMENT_SERVICE_HOST on "
+    "'fly logs --app placement-prod' must show NOTHING for it. A misspelled PLACEMENT_SERVICE_HOST on "
     "seazn-club-stg silently routes staging to production.\""
 )
 MACHINE_COUNT_REMINDER = (
@@ -341,18 +341,18 @@ def test_the_real_fly_toml_passes_both_app_name_checks(tmp_path):
         assert result.returncode == 0, (name, result.stdout, result.stderr)
         assert "::error::" not in result.stdout, result.stdout
         # prod hands the app to its later steps through the step output.
-        assert written == (["app=placement"] if name == "prod.yml" else []), (name, written)
+        assert written == (["app=placement-prod"] if name == "prod.yml" else []), (name, written)
 
 
 APP_LINES = {
     "renamed": ('app = "placement-stg"\n', False),
-    "forked-prod": ('app = "placement-prod"\n', False),
-    "prefix": ('app = "placement2"\n', False),
+    "legacy-prod-name": ('app = "placement"\n', False),
+    "prefix": ('app = "placement-prod2"\n', False),
     "empty": ('app = ""\n', False),
     "absent": ('primary_region = "lhr"\n', False),
-    "commented-out": ('# app = "placement"\nprimary_region = "lhr"\n', False),
-    "indented-and-spaced": ('  app   =   "placement"   # the production app\n', True),
-    "plain": ('app = "placement"\n', True),
+    "commented-out": ('# app = "placement-prod"\nprimary_region = "lhr"\n', False),
+    "indented-and-spaced": ('  app   =   "placement-prod"   # the production app\n', True),
+    "plain": ('app = "placement-prod"\n', True),
 }
 # prod.yml tells "no app name at all" apart from "the wrong app name"; stg.yml has the one check.
 NO_APP_NAME = {"empty", "absent", "commented-out"}
@@ -360,17 +360,17 @@ NO_APP_NAME = {"empty", "absent", "commented-out"}
 
 @pytest.mark.parametrize("name", DEPLOY_WORKFLOWS)
 @pytest.mark.parametrize("case", sorted(APP_LINES))
-def test_the_app_name_check_accepts_only_placement(name, case, tmp_path):
+def test_the_app_name_check_accepts_only_placement_prod(name, case, tmp_path):
     toml, ok = APP_LINES[case]
     result, written = _run_verify(name, tmp_path, toml + "[build]\n")
     if ok:
         assert result.returncode == 0, (name, case, result.stdout, result.stderr)
         if name == "prod.yml":
-            assert written == ["app=placement"], written
+            assert written == ["app=placement-prod"], written
     else:
         assert result.returncode == 1, (name, case, result.stdout, result.stderr)
         assert "::error::" in result.stdout, result.stdout
-        reason = "no app name in fly.toml" if name == "prod.yml" and case in NO_APP_NAME else "expected 'placement'"
+        reason = "no app name in fly.toml" if name == "prod.yml" and case in NO_APP_NAME else "expected 'placement-prod'"
         assert reason in result.stdout, (name, case, reason, result.stdout)
         assert written == [], f"a failed check must not hand an app name on: {written}"
 

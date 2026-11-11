@@ -2,7 +2,7 @@
 
 The CP-SAT placement gRPC service (Python 3.14, OR-Tools). It is consumed only
 by `onryde/seazn.club`'s `packages/scheduler`, over Fly private networking
-(`placement.flycast:50051`). It is an internal service: never reachable from the
+(`placement-prod.flycast:50051`). It is an internal service: never reachable from the
 public internet. The repo and its one image are public, because nothing in
 either is secret; "internal" governs the network, not visibility.
 
@@ -43,7 +43,7 @@ The order for a contract change is:
 
 - stg (`placement-stg`, `stg.yml`) deploys that commit's published image when `ci`
   succeeds for a push to `main`, and only while the commit is still the tip of `main`.
-- prod (`placement`, `prod.yml`) deploys the tagged commit's published image on a
+- prod (`placement-prod`, `prod.yml`) deploys the tagged commit's published image on a
   `v*.*.*` tag, and fails if there is none.
 - Neither rebuilds. The only artifact is the public image
   `ghcr.io/onryde/seazn-placement:<sha>`, published by `ci.yml` from `main`. Tags are

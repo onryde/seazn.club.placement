@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 
 #: What the service bound before `PLACEMENT_BIND_HOST` existed: the dual-stack
-#: wildcard. Fly's private IPv6 network (`placement.flycast`) reaches the
+#: wildcard. Fly's private IPv6 network (`placement-prod.flycast`) reaches the
 #: machine through it, so this is a production contract, not a preference.
 DEFAULT_BIND_HOST = "[::]"
 

@@ -33,9 +33,9 @@
 # `fly ips allocate-*` step nothing here performs, and doing it would
 # contradict the assumption the whole security model rests on.
 #
-# `app` MUST be exactly "placement". Fly's private DNS derives from the app
+# `app` MUST be exactly "placement-prod". Fly's private DNS derives from the app
 # name, and `placement-client.ts`'s DEFAULT_HOST is the literal
-# "placement.flycast:50051" (placement-client.ts:157) — NOT
+# "placement-prod.flycast:50051" (placement-client.ts:157) — NOT
 # "placement.internal:50051" (an earlier draft of this comment said .internal;
 # see [2] for why .flycast is required once the machine can suspend). It only
 # yields to an explicit PLACEMENT_SERVICE_HOST env var. Naming this app
@@ -309,7 +309,7 @@
 # 0 guards against — loud in the response, and reverted by unsetting.
 #
 # -----------------------------------------------------------------------------
-# [8] SECRETS  (fly secrets set --app placement)
+# [8] SECRETS  (fly secrets set --app placement-prod)
 #
 # PLACEMENT_SERVICE_SECRET — new, and distinct from apps/web's CRON_SECRET.
 # Never reuse that value; a shared secret would let either service
@@ -354,7 +354,7 @@
 #     trusting this file.
 # =============================================================================
 
-app = "placement"                     # [1] MUST be exactly this — .flycast DNS
+app = "placement-prod"                     # [1] MUST be exactly this — .flycast DNS
 primary_region = "lhr"                # [1] matches apps/web
 
 [build]
