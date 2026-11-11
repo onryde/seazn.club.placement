@@ -116,7 +116,7 @@ jobs:
           version: ${{ env.FLYCTL_VERSION }}
 
       # The app name is OVERRIDDEN, not read — and this is the one place in
-      # the repo where that is correct. `fly.toml` says `app = "placement"`
+      # the repo where that is correct. `fly.toml` says `app = "placement-prod"`
       # because staging deploys the SAME config with `--app placement-stg`
       # (deliberately: a forked TOML would drift and make staging a worse
       # rehearsal for the thing it exists to rehearse).
@@ -129,8 +129,8 @@ jobs:
       - name: Verify fly.toml still names the production app
         run: |
           app="$(sed -n 's/^[[:space:]]*app[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' fly.toml | head -1)"
-          if [ "$app" != "placement" ]; then
-            echo "::error::fly.toml app is '$app', expected 'placement'. This job deploys that same config with --app placement-stg; if the file has been renamed or forked, that override is no longer the right thing to do."
+          if [ "$app" != "placement-prod" ]; then
+            echo "::error::fly.toml app is '$app', expected 'placement-prod'. This job deploys that same config with --app placement-stg; if the file has been renamed or forked, that override is no longer the right thing to do."
             exit 1
           fi
 
@@ -187,6 +187,6 @@ jobs:
         run: |
           flyctl status --app placement-stg || true
           echo "::notice::Attempted a deploy of ${IMAGE} to placement-stg; the deploy step above says whether it succeeded."
-          echo "::notice::VERIFY BY LOG ATTRIBUTION, not by reading the env var: run one Auto-schedule on stg.seazn.club, then 'fly logs --app placement-stg' must show a 'solve request=' line and 'fly logs --app placement' must show NOTHING for it. A misspelled PLACEMENT_SERVICE_HOST on seazn-club-stg silently routes staging to production."
+          echo "::notice::VERIFY BY LOG ATTRIBUTION, not by reading the env var: run one Auto-schedule on stg.seazn.club, then 'fly logs --app placement-stg' must show a 'solve request=' line and 'fly logs --app placement-prod' must show NOTHING for it. A misspelled PLACEMENT_SERVICE_HOST on seazn-club-stg silently routes staging to production."
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_TOKEN }}

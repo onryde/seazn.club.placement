@@ -44,7 +44,7 @@ PLACEMENT_SERVICE_HOST=localhost:50051 PLACEMENT_SERVICE_SECRET=dev-secret \
 ```
 
 Without `PLACEMENT_SERVICE_HOST` set, those same suites SKIP instead of dialing
-the production default (`placement.flycast:50051`, unreachable from a dev
+the production default (`placement-prod.flycast:50051`, unreachable from a dev
 machine) — that is the correct, expected behaviour, not a failure:
 
 ```bash

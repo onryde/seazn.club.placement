@@ -4,7 +4,7 @@
     scripts/require-private-ips.py <app>
 
 The placement service is internal: it is reached only over Fly private networking
-(``placement.flycast:50051``), never from the internet. DEPLOY.md, step 2 allocates
+(``placement-prod.flycast:50051``), never from the internet. DEPLOY.md, step 2 allocates
 its one private v6; the design's security model (a shared secret instead of mTLS)
 assumes there is nothing else. This runs after each deploy and checks it still holds:
 
